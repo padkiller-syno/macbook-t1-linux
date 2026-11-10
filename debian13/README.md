@@ -1,11 +1,13 @@
 # MacBook Pro 13,3 (2016, Touch Bar) sous Debian 13
 
 Même machine que la version Fedora, cette fois sous **Debian 13 (trixie)**,
-kernel **`6.12.113+deb13-amd64`**, GNOME 48 / **Wayland**, LUKS + LVM.
-Session de remise en état du 20/10/2026.
+GNOME 48 / **Wayland**, LUKS + LVM. Session de remise en état du 20/10/2026.
 
-Différence majeure avec Fedora : le kernel Debian est un **6.12**, alors que
-t1bridge cible les kernels **7.x**. Deux modules ont dû être portés.
+**Noyau** : **`7.2.11+deb13-amd64` (trixie-backports) par défaut depuis le
+07/11/2026** ; les `6.12` de trixie restent installés en secours (voir
+[Noyau 7.2](#noyau-72-trixie-backports)). L'installation a d'abord été faite en
+**6.12**, alors que t1bridge cible les kernels **7.x** : deux modules ont dû
+être portés (patchs conservés pour les 6.12, code d'origine en 7.2).
 
 ## Statut
 
@@ -14,7 +16,8 @@ t1bridge cible les kernels **7.x**. Deux modules ont dû être portés.
 | **Wi-Fi** BCM43602 (5 GHz, signal) | ✅ -55 dBm en 5 GHz (contre -89 dBm en 2,4 GHz avant) | [`wifi/`](wifi/) |
 | **Son** CS8409 (haut-parleurs + micro interne) | ✅ — ❌ micro du casque jack non pris en charge | [`son/`](son/) |
 | **T1 en recovery** (`05ac:1281`) | ✅ régénérée avec t1-revive | [`t1-revive/`](#t1-revive-t1-bloquée-en-recovery) |
-| **Touch Bar** | ✅ (t1bridge, modules portés en 6.12), allumée dès l'écran de connexion | [`touchbar/`](touchbar/) |
+| **Noyau 7.2** (trixie-backports) | ✅ par défaut, 6.12 en secours ; tous les modules sous DKMS pour les deux | [`noyau-7.2/`](#noyau-72-trixie-backports) |
+| **Touch Bar** | ✅ (t1bridge : modules portés en 6.12, d'origine en 7.2), allumée dès l'écran de connexion | [`touchbar/`](touchbar/) |
 | **Caméra** FaceTime HD | ✅ caméra virtuelle à la demande (Meet, Firefox, GNOME Caméra) | [`camera/`](camera/) |
 | **Écran noir / gel** (amdgpu Polaris) | ✅ niveau DPM fixe (`high`, ou `low` en économie d'énergie) |
 | **Profils d'énergie** (CPU, turbo, secteur) | ✅ économie 1200 MHz, équilibré sans turbo, performance turbo ; secteur → équilibré | [`display/`](#écran-noir--gel--amdgpu-polaris) |
@@ -781,6 +784,42 @@ Rien à faire : le capteur de la T1 apparaît en `iio:device0` (`als`, via
 (`HasAmbientLight = true`, valeur en lux) et GNOME a déjà
 `org.gnome.settings-daemon.plugins.power ambient-enabled = true`
 (Paramètres → Énergie → Luminosité automatique).
+
+## Noyau 7.2 (trixie-backports)
+
+Passage au **7.2.11** de trixie-backports, **par défaut depuis le 07/11/2026**,
+pour des gels et glitches amdgpu au branchement d'un écran MST. Testé le 06/11 :
+modules DKMS, Touch Bar (aussi sur l'écran de connexion), Touch ID, son,
+caméra, Wi-Fi, profils d'énergie. Les noyaux 6.12 restent installés en secours.
+
+Scripts dans [`noyau-7.2/`](noyau-7.2/) :
+
+1. [`install-noyau-7.2.sh`](noyau-7.2/install-noyau-7.2.sh) : `GRUB_DEFAULT=saved`
+   (le 6.12 reste par défaut pendant l'essai), DKMS préparé pour les deux
+   familles, puis `linux-image-amd64` + `linux-headers-amd64` depuis
+   `trixie-backports`, et contrôle de chaque module compilé pour la 7.2 ;
+2. [`fix-son-dkms.sh`](noyau-7.2/fix-son-dkms.sh) +
+   [`finir-7.2.sh`](noyau-7.2/finir-7.2.sh) : reprise après l'échec DKMS du son
+   (voir pièges), fin de configuration du paquet noyau, entrée GRUB vérifiée ;
+3. essai unique : `sudo grub-reboot '<entrée 7.2>' && sudo reboot` (en cas de
+   plantage, le redémarrage suivant revient au 6.12) ;
+4. une fois validé : `sudo grub-set-default '<entrée 7.2>'`.
+
+| Module | 6.12 | 7.2 |
+|---|---|---|
+| t1bridge (`t1_cfgsel`, `appletbdrm`, `apple_t1_ncm`, `uvcvideo`) | `t1bridge-debian` (patché), `BUILD_EXCLUSIVE_KERNEL="^6\."` | `t1bridge-upstream` 0.1.12, code d'origine (`/usr/src/t1bridge-upstream-0.1.12`), `BUILD_EXCLUSIVE_KERNEL="^7\."` |
+| son `snd-hda-codec-cs8409` | `build/hda` | `build/hda/codecs/cirrus` (arborescence HDA réorganisée en 6.17) |
+| `v4l2loopback` (caméra) | 0.15.4 | 0.15.4 de **sid** (`v4l2loopback-dkms_0.15.4-2_all.deb`, à placer à côté du script) : la 0.15.0 de trixie ne compile pas en 7.2 |
+
+Pièges :
+- `dkms.conf` est lu comme un script shell avec `$kernelver` : un `case` y
+  choisit l'emplacement du module son selon la version
+  ([`fix-son-dkms.sh`](noyau-7.2/fix-son-dkms.sh)).
+- **Un module DKMS en échec fait échouer la configuration du paquet noyau
+  avant `update-grub`** : le noyau est installé mais absent du menu. Corriger le
+  module puis `dpkg --configure -a`.
+- Menu GRUB caché : `Échap` ne marche qu'au clavier externe ; sinon
+  `grub-reboot` depuis Linux.
 
 ## Après une mise à jour du kernel — DKMS
 

@@ -10,7 +10,7 @@ configurer (projet [t1bridge](https://github.com/standardagents/t1bridge)).
 
 | Distribution | État | Dossier |
 |---|---|---|
-| **Debian 13 (trixie)**, GNOME 48 / Wayland | ✅ **version suivie**, la plus complète | [`debian13/`](debian13/README.md) |
+| **Debian 13 (trixie)**, noyau 7.2 (backports), GNOME 48 / Wayland | ✅ **version suivie**, la plus complète | [`debian13/`](debian13/README.md) |
 | Fedora 44 | archive (Touch Bar, caméra, clavier, écran) | [`fedora44/`](fedora44/README.md) |
 
 ## Machine
@@ -29,7 +29,8 @@ configurer (projet [t1bridge](https://github.com/standardagents/t1bridge)).
 | **Wi-Fi** BCM43602 (5 GHz, signal) | ✅ -55 dBm en 5 GHz (contre -89 dBm en 2,4 GHz avant) | [`wifi/`](debian13/wifi/) |
 | **Son** CS8409 (haut-parleurs + micro interne) | ✅ — ❌ micro du casque jack non pris en charge | [`son/`](debian13/son/) |
 | **T1 en recovery** (`05ac:1281`) | ✅ régénérée avec t1-revive | [`t1-revive/`](debian13/README.md#t1-revive-t1-bloquée-en-recovery) |
-| **Touch Bar** | ✅ (t1bridge, modules portés en 6.12), allumée dès l'écran de connexion | [`touchbar/`](debian13/touchbar/) |
+| **Noyau 7.2** (trixie-backports) | ✅ par défaut, 6.12 en secours ; tous les modules sous DKMS pour les deux | [`noyau-7.2/`](debian13/README.md#noyau-72-trixie-backports) |
+| **Touch Bar** | ✅ (t1bridge : modules portés en 6.12, d'origine en 7.2), allumée dès l'écran de connexion | [`touchbar/`](debian13/touchbar/) |
 | **Caméra** FaceTime HD | ✅ caméra virtuelle à la demande (Meet, Firefox, GNOME Caméra) | [`camera/`](debian13/camera/) |
 | **Écran noir / gel** (amdgpu Polaris) | ✅ niveau DPM fixe (`high`, ou `low` en économie d'énergie) |
 | **Profils d'énergie** (CPU, turbo, secteur) | ✅ économie 1200 MHz, équilibré sans turbo, performance turbo ; secteur → équilibré | [`display/`](debian13/README.md#écran-noir--gel--amdgpu-polaris) |

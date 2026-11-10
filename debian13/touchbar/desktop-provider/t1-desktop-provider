@@ -107,6 +107,10 @@ case "${2:-}" in
   launch-app)   # N = rang dans le panneau ; l'id vient du cache écrit par t1-touchbar-apps (icône et lanceur alignés)
     [[ ${3:-} =~ ^[0-9]+$ ]] || exit 2
     read -r app <"${XDG_CACHE_HOME:-$HOME/.cache}/t1bridge/apps/$3.id" 2>/dev/null || exit 1
-    setsid -f gtk-launch "$app" </dev/null >/dev/null 2>&1 ;;   # détaché : rendre la main tout de suite
+    # Lancé par le gestionnaire systemd de la session, pas par ce script : l'appli reçoit l'environnement
+    # graphique à jour (le service Touch Bar démarre avant que GNOME ait publié WAYLAND_DISPLAY) et sa propre
+    # unité (sinon elle vivrait dans le cgroup du service Touch Bar et mourrait avec lui).
+    # ExitType=cgroup : l'unité reste active tant que l'appli tourne, gtk-launch rendant la main aussitôt.
+    systemd-run --user --collect --quiet -p ExitType=cgroup -- gtk-launch "$app" </dev/null >/dev/null 2>&1 ;;
   *) exit 2 ;;
 esac

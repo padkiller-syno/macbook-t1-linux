@@ -766,8 +766,13 @@ les contrôles à 176 px (au lieu de 182).
 - le renderer relit ce dossier à chaque relevé (1 s) : pas de redémarrage ; il
   ne décode aucune image, il recopie les pixels ;
 - lancement : action `launch-app N` du fournisseur, qui relit `N.id` et lance
-  `setsid -f gtk-launch <id>` (détaché : une appli lente ne bloque pas le délai
-  de 500 ms).
+  `systemd-run --user --collect -p ExitType=cgroup -- gtk-launch <id>`. Piège :
+  un simple `setsid -f gtk-launch` ne lançait rien depuis la Touch Bar. Le
+  service démarre avant que GNOME publie `WAYLAND_DISPLAY`/`DISPLAY` (l'appli ne
+  trouve pas l'écran), et l'appli vivrait dans le cgroup du service Touch Bar
+  (tuée avec lui). Via `systemd-run`, elle reçoit l'environnement à jour du
+  gestionnaire de session et sa propre unité ; `ExitType=cgroup` garde l'unité
+  tant que l'appli tourne.
 
 La touche Option gauche aurait pu ouvrir ce panneau, mais le clavier SPI n'est
 pas lu par la Touch Bar : il aurait fallu donner à la session l'accès à tout le

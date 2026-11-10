@@ -104,5 +104,9 @@ case "${2:-}" in
   media-previous)    mpris Previous ;;
   media-play-pause)  mpris PlayPause ;;
   media-next)        mpris Next ;;
+  launch-app)   # N = rang dans le panneau ; l'id vient du cache écrit par t1-touchbar-apps (icône et lanceur alignés)
+    [[ ${3:-} =~ ^[0-9]+$ ]] || exit 2
+    read -r app <"${XDG_CACHE_HOME:-$HOME/.cache}/t1bridge/apps/$3.id" 2>/dev/null || exit 1
+    setsid -f gtk-launch "$app" </dev/null >/dev/null 2>&1 ;;   # détaché : rendre la main tout de suite
   *) exit 2 ;;
 esac

@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""Prépare les icônes du panneau d'applications de la Touch Bar.
+
+Lit ~/.config/t1bridge/apps.conf (un identifiant .desktop par ligne, # = commentaire)
+et écrit ~/.cache/t1bridge/apps/N.rgba : largeur et hauteur (u32 petit-boutiste)
+puis les pixels RGBA. Le renderer les recharge seul ; le lancement passe par
+`t1-desktop-provider v1 launch-app N`.
+"""
+import os
+import struct
+import sys
+import warnings
+
+warnings.filterwarnings("ignore")
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gio, Gtk  # noqa: E402
+
+SIZE = 40
+CONF = os.path.expanduser("~/.config/t1bridge/apps.conf")
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "t1bridge/apps")
+
+
+def app_ids():
+    with open(CONF) as conf:
+        for line in conf:
+            line = line.split("#", 1)[0].strip()
+            if line:
+                yield line if line.endswith(".desktop") else line + ".desktop"
+
+
+def icon_rgba(app_id, theme):
+    info = Gio.DesktopAppInfo.new(app_id)
+    if info is None:
+        raise LookupError(f"{app_id} : lanceur introuvable")
+    icon = theme.lookup_by_gicon(info.get_icon(), SIZE, Gtk.IconLookupFlags.FORCE_SIZE)
+    if icon is None:
+        raise LookupError(f"{app_id} : icône introuvable")
+    pixbuf = icon.load_icon().add_alpha(False, 0, 0, 0)
+    w, h, stride, data = pixbuf.get_width(), pixbuf.get_height(), pixbuf.get_rowstride(), pixbuf.get_pixels()
+    rows = b"".join(data[y * stride:y * stride + w * 4] for y in range(h))
+    return info.get_name(), struct.pack("<II", w, h) + rows
+
+
+def main():
+    theme = Gtk.IconTheme.get_default()
+    os.makedirs(CACHE, exist_ok=True)
+    for old in os.listdir(CACHE):
+        if old.endswith(".rgba"):
+            os.remove(os.path.join(CACHE, old))
+    index = 0
+    for app_id in app_ids():
+        try:
+            name, blob = icon_rgba(app_id, theme)
+        except LookupError as error:
+            print(f"ignoré : {error}", file=sys.stderr)
+            continue
+        tmp = os.path.join(CACHE, f".{index}.tmp")
+        with open(tmp, "wb") as out:
+            out.write(blob)
+        os.replace(tmp, os.path.join(CACHE, f"{index}.rgba"))
+        with open(os.path.join(CACHE, f"{index}.id"), "w") as out:
+            out.write(app_id + "\n")
+        print(f"{index} : {name} ({app_id})")
+        index += 1
+
+
+if __name__ == "__main__":
+    main()

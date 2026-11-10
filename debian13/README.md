@@ -699,9 +699,10 @@ remplacé par
 [`t1bridge-touchbar-capsules-jauges.patch`](touchbar/patches/t1bridge-touchbar-capsules-jauges.patch)
 (sur t1bridge `81cbdf8`, appliqué par `install-touchbar.sh`) :
 
-- **capsules** : touches regroupées par fonction (luminosité, clavier, média,
-  volume) dans une pilule, séparateurs fins, touche enfoncée en pilule plus
-  claire ; touches Fn en pilules ; léger dégradé vertical ;
+- **groupes** : touches regroupées par fonction (luminosité, clavier, média,
+  volume) dans une même plaque, séparateurs fins, touche enfoncée plus claire ;
+  coins de 10 px, proches des touches du clavier (d'abord des pilules de 30 px) ;
+  léger dégradé vertical ;
 - **icônes** : Adwaita symboliques + soleils et rétroéclairage dessinés à la
   taille native (2170×60, aucune mise à l'échelle) par
   [`touchbar-icons.py`](touchbar/touchbar-icons.py)
@@ -746,6 +747,32 @@ bash pur, 3 appels par seconde (`wpctl get-volume`, MPRIS, Mutter) et un cache
 de 5 s (`$XDG_RUNTIME_DIR/t1-desktop-provider.cache`) rafraîchi **en
 arrière-plan** (`flock -n … v1 refresh-cache`) pour le lecteur, la sortie, la
 veilleuse et la luminosité auto → ~150 ms en mode économie.
+
+### Panneau d'applications
+
+La touche **grille** à droite d'esc remplace les contrôles par une page
+d'icônes en couleur ; un appui lance l'application et ramène la page normale,
+**×** referme sans rien lancer. Pour faire de la place, esc passe à 140 px et
+les contrôles à 176 px (au lieu de 182).
+
+- liste : [`apps.conf`](touchbar/desktop-provider/apps.conf) →
+  `~/.config/t1bridge/apps.conf`, un identifiant `.desktop` par ligne (Flatpak
+  compris : `com.plexamp.Plexamp`…) ;
+- [`t1-touchbar-apps`](touchbar/desktop-provider/t1-touchbar-apps) (à relancer
+  après chaque modification de la liste) : retrouve l'icône du thème via GTK
+  (SVG ou PNG), l'écrit en 40 px dans `~/.cache/t1bridge/apps/N.rgba` (largeur et
+  hauteur en u32 petit-boutiste, puis RGBA brut) avec l'identifiant dans `N.id` ;
+  une appli introuvable est sautée pour l'icône **et** le lancement ;
+- le renderer relit ce dossier à chaque relevé (1 s) : pas de redémarrage ; il
+  ne décode aucune image, il recopie les pixels ;
+- lancement : action `launch-app N` du fournisseur, qui relit `N.id` et lance
+  `setsid -f gtk-launch <id>` (détaché : une appli lente ne bloque pas le délai
+  de 500 ms).
+
+La touche Option gauche aurait pu ouvrir ce panneau, mais le clavier SPI n'est
+pas lu par la Touch Bar : il aurait fallu donner à la session l'accès à tout le
+clavier (groupe `input`, toutes les frappes lisibles) ou patcher le service
+matériel root. D'où la touche sur la barre.
 
 Rendu d'une image : ~4 ms (release). Annuler : réinstaller le binaire d'origine
 (`git -C t1bridge checkout -- crates/t1-touchbar` puis rebuild).

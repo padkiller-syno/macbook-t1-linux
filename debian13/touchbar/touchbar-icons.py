@@ -110,6 +110,38 @@ icons = {
     "VOLUME_DOWN": svg_mask("status/audio-volume-low-symbolic.svg", ICON),
     "VOLUME_UP": svg_mask("status/audio-volume-high-symbolic.svg", ICON),
 }
+def apps_grid(size):
+    # grille 3×3 de pastilles arrondies, façon lanceur d'applications
+    def p(ctx):
+        cell, dot = size / 3, size * 0.2
+        for row in range(3):
+            for col in range(3):
+                x = col * cell + (cell - dot) / 2
+                y = row * cell + (cell - dot) / 2
+                r = dot * 0.3
+                ctx.new_sub_path()
+                ctx.arc(x + dot - r, y + r, r, -math.pi / 2, 0)
+                ctx.arc(x + dot - r, y + dot - r, r, 0, math.pi / 2)
+                ctx.arc(x + r, y + dot - r, r, math.pi / 2, math.pi)
+                ctx.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+                ctx.close_path()
+        ctx.fill()
+    return drawn(size, size, p)
+
+
+def close_cross(size):
+    def p(ctx):
+        m = size * 0.22
+        ctx.set_line_width(2.6)
+        ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+        ctx.move_to(m, m); ctx.line_to(size - m, size - m)
+        ctx.move_to(size - m, m); ctx.line_to(m, size - m)
+        ctx.stroke()
+    return drawn(size, size, p)
+
+
+icons["APPS"] = apps_grid(24)
+icons["CLOSE"] = close_cross(24)
 icons["PLAY"] = svg_mask("actions/media-playback-start-symbolic.svg", ICON)
 icons["PAUSE"] = svg_mask("actions/media-playback-pause-symbolic.svg", ICON)
 labels = {"ESC": text_mask("esc", 20)}
@@ -216,7 +248,7 @@ def emit_icons(path):
     out = ["//! Generated alpha masks: Adwaita symbolic icons (CC BY-SA 3.0) and cairo-drawn",
            "//! brightness glyphs, rendered at native Touch Bar size by `touchbar-icons.py`.", "",
            "use crate::stock_labels::AlphaMask;", ""]
-    for name in ORDER + ["PLAY", "PAUSE"]:
+    for name in ORDER + ["PLAY", "PAUSE", "APPS", "CLOSE"]:
         w, h, px = icons[name]
         out.append(f"const {name}_PIXELS: &[u8] = &[")
         for i in range(0, len(px), 24):

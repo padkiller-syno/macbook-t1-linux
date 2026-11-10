@@ -1,8 +1,16 @@
 diff --git a/crates/t1-touchbar/src/builtin_renderer.rs b/crates/t1-touchbar/src/builtin_renderer.rs
-index 90cead9..fb477fa 100644
+index 90cead9..84a3081 100644
 --- a/crates/t1-touchbar/src/builtin_renderer.rs
 +++ b/crates/t1-touchbar/src/builtin_renderer.rs
-@@ -36,6 +36,11 @@ const RECEIVE_RETRY_DELAY: Duration = Duration::from_millis(5);
+@@ -20,6 +20,7 @@ use t1_touchbar_hw::wire::{
+ 
+ use crate::desktop_provider::{DesktopAction, DesktopCapabilities, DesktopProvider, DesktopState};
+ use crate::framebuffer::Xrgb8888Frame;
++use crate::stock_art::AppIcon;
+ use crate::gesture::{DisplayContact, GestureEngine, GestureSettings};
+ use crate::overlay_state::{OverlayState, OverlayWatcher};
+ use crate::stock_slice::{
+@@ -36,6 +37,11 @@ const RECEIVE_RETRY_DELAY: Duration = Duration::from_millis(5);
  const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(50);
  const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(2);
  const VOLUME_STEP_PERCENT: u8 = 6;
@@ -14,7 +22,7 @@ index 90cead9..fb477fa 100644
  const HOLD_REPEAT_DELAY: Duration = Duration::from_millis(350);
  const HOLD_REPEAT_INTERVAL: Duration = Duration::from_millis(90);
  const OVERLAY_FADE_DURATION: Duration = Duration::from_millis(150);
-@@ -339,6 +344,10 @@ struct RendererSession {
+@@ -339,6 +345,11 @@ struct RendererSession {
      pending_desktop_state: Option<DesktopState>,
      display_off: bool,
      levels: StockLevels,
@@ -22,10 +30,11 @@ index 90cead9..fb477fa 100644
 +    levels_grace_until: Duration,
 +    gauge_last_update: Duration,
 +    track: Option<TrackClock>,
++    apps: Vec<AppIcon>,
      touch_id: TouchIdOverlay,
      overlay_state: Option<OverlayState>,
      overlay_visual_state: Option<OverlayState>,
-@@ -390,6 +399,10 @@ impl RendererSession {
+@@ -390,6 +401,11 @@ impl RendererSession {
              pending_desktop_state: None,
              display_off: false,
              levels: StockLevels::default(),
@@ -33,10 +42,11 @@ index 90cead9..fb477fa 100644
 +            levels_grace_until: Duration::ZERO,
 +            gauge_last_update: Duration::ZERO,
 +            track: None,
++            apps: Vec::new(),
              touch_id,
              overlay_state: None,
              overlay_visual_state: None,
-@@ -636,6 +649,9 @@ impl RendererSession {
+@@ -636,6 +652,9 @@ impl RendererSession {
          }
          match action {
              StockAction::StepDisplayBrightness(direction) => {
@@ -46,7 +56,7 @@ index 90cead9..fb477fa 100644
                  let feedback = self
                      .desktop_state
                      .capabilities
-@@ -648,6 +664,9 @@ impl RendererSession {
+@@ -648,6 +667,9 @@ impl RendererSession {
                  )
              }
              StockAction::StepKeyboardBacklight(direction) => {
@@ -56,7 +66,7 @@ index 90cead9..fb477fa 100644
                  let feedback = self
                      .desktop_state
                      .capabilities
-@@ -661,7 +680,7 @@ impl RendererSession {
+@@ -661,7 +683,7 @@ impl RendererSession {
              }
              StockAction::ToggleMute => {
                  self.levels.muted = !self.levels.muted;
@@ -65,7 +75,7 @@ index 90cead9..fb477fa 100644
                  dispatch_desktop(provider, DesktopAction::ToggleMute);
                  Ok(())
              }
-@@ -672,7 +691,7 @@ impl RendererSession {
+@@ -672,7 +694,7 @@ impl RendererSession {
                      StepDirection::Up => current.saturating_add(VOLUME_STEP_PERCENT).min(100),
                  };
                  self.levels.volume = Some(value);
@@ -74,7 +84,7 @@ index 90cead9..fb477fa 100644
                  dispatch_desktop(provider, DesktopAction::SetVolume(value));
                  Ok(())
              }
-@@ -681,6 +700,8 @@ impl RendererSession {
+@@ -681,6 +703,8 @@ impl RendererSession {
                  Ok(())
              }
              StockAction::MediaPlayPause => {
@@ -83,12 +93,32 @@ index 90cead9..fb477fa 100644
                  dispatch_desktop(provider, DesktopAction::MediaPlayPause);
                  Ok(())
              }
-@@ -754,7 +775,17 @@ impl RendererSession {
+@@ -688,6 +712,19 @@ impl RendererSession {
+                 dispatch_desktop(provider, DesktopAction::MediaNext);
+                 Ok(())
+             }
++            StockAction::ToggleApps => {
++                let open = !self.stock.apps_open();
++                if open {
++                    self.apps = load_app_icons();
++                }
++                self.set_apps_page(open);
++                Ok(())
++            }
++            StockAction::LaunchApp(index) => {
++                dispatch_desktop(provider, DesktopAction::LaunchApp(index));
++                self.set_apps_page(false);
++                Ok(())
++            }
+             StockAction::Escape | StockAction::Function(_) => unreachable!(),
+         }
+     }
+@@ -754,7 +791,18 @@ impl RendererSession {
          .map_err(|_| BuiltinRendererError::Frame)?;
          let fn_visible = self.input.fn_pressed() && self.overlay_visual_state.is_none();
          self.stock
 -            .render_pressed(&mut frame, fn_visible, self.levels, self.input.pressed())
-+            .render_pressed(
++            .render_with_apps(
 +                &mut frame,
 +                fn_visible,
 +                StockLevels {
@@ -98,11 +128,12 @@ index 90cead9..fb477fa 100644
 +                    ..self.levels
 +                },
 +                self.input.pressed(),
++                &self.apps,
 +            )
              .map_err(|_| BuiltinRendererError::Frame)?;
          if self.overlay_opacity > 0 {
              let left = self.stock.escape_right();
-@@ -832,6 +863,8 @@ impl RendererSession {
+@@ -832,6 +880,8 @@ impl RendererSession {
          self.now = now;
          self.advance_overlay_fade(now);
          self.advance_enrollment_progress(now);
@@ -111,7 +142,7 @@ index 90cead9..fb477fa 100644
          if !self.display_off
              && !self.input.wait_for_touch_release
              && let Some(action) = self.input.take_repeat(now)
-@@ -841,6 +874,44 @@ impl RendererSession {
+@@ -841,6 +891,44 @@ impl RendererSession {
          self.submit_if_ready(connection)
      }
  
@@ -156,7 +187,35 @@ index 90cead9..fb477fa 100644
      fn advance_overlay_fade(&mut self, now: Duration) {
          if self.overlay_opacity == self.overlay_target_opacity {
              return;
-@@ -898,12 +969,13 @@ impl RendererSession {
+@@ -888,7 +976,27 @@ impl RendererSession {
+         self.dirty = true;
+     }
+ 
++    /// Rebuilds the bar geometry for the launcher entries and page state.
++    fn set_apps_page(&mut self, open: bool) {
++        let count = u8::try_from(self.apps.len()).unwrap_or(u8::MAX);
++        let stock = self.stock.with_apps(count, open);
++        if stock != self.stock {
++            self.stock = stock;
++            self.input.set_stock(stock);
++        }
++        self.dirty = true;
++    }
++
++    /// Picks up launcher icons written by the desktop provider's helper.
++    fn sync_app_icons(&mut self) {
++        if app_icon_count() != self.apps.len() {
++            self.apps = load_app_icons();
++            self.set_apps_page(self.stock.apps_open());
++        }
++    }
++
+     fn set_desktop_state(&mut self, state: DesktopState) -> Result<(), BuiltinRendererError> {
++        self.sync_app_icons();
+         // Display power follows the desktop immediately, even under an active
+         // touch: a dark panel must not keep showing controls.
+         if self.display_off != state.display_off {
+@@ -898,12 +1006,13 @@ impl RendererSession {
              }
              self.dirty = true;
          }
@@ -176,8 +235,16 @@ index 90cead9..fb477fa 100644
              return Ok(());
          }
          if !self.input.is_idle() {
-@@ -933,14 +1005,43 @@ impl RendererSession {
-         .map_err(|_| BuiltinRendererError::Negotiation)?;
+@@ -930,17 +1039,50 @@ impl RendererSession {
+             self.dimensions.height(),
+             capabilities,
+         )
+-        .map_err(|_| BuiltinRendererError::Negotiation)?;
++        .map_err(|_| BuiltinRendererError::Negotiation)?
++        .with_apps(
++            u8::try_from(self.apps.len()).unwrap_or(u8::MAX),
++            self.stock.apps_open(),
++        );
          self.stock = stock;
          self.input.set_stock(stock);
 -        self.levels.volume = state.volume;
@@ -222,10 +289,43 @@ index 90cead9..fb477fa 100644
      fn allocate_request(&mut self, kind: PendingRequest) -> Result<u32, BuiltinRendererError> {
          if self.pending.len() >= MAX_PENDING_REQUESTS {
              return Err(BuiltinRendererError::Protocol);
-@@ -960,6 +1061,45 @@ impl RendererSession {
+@@ -960,6 +1102,78 @@ impl RendererSession {
      }
  }
  
++/// Launcher icons: `N.rgba` (0, 1, …) written by `t1-touchbar-apps`; none in tests.
++fn app_icon_dir() -> Option<std::path::PathBuf> {
++    if cfg!(test) {
++        return None;
++    }
++    let cache = std::env::var_os("XDG_CACHE_HOME")
++        .map(std::path::PathBuf::from)
++        .or_else(|| std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(".cache")))?;
++    Some(cache.join("t1bridge/apps"))
++}
++
++fn app_icon_count() -> usize {
++    let Some(dir) = app_icon_dir() else {
++        return 0;
++    };
++    (0..usize::from(u8::MAX))
++        .take_while(|index| dir.join(format!("{index}.rgba")).is_file())
++        .count()
++}
++
++fn load_app_icons() -> Vec<AppIcon> {
++    let Some(dir) = app_icon_dir() else {
++        return Vec::new();
++    };
++    (0..app_icon_count())
++        .map_while(|index| {
++            std::fs::read(dir.join(format!("{index}.rgba")))
++                .ok()
++                .and_then(|bytes| AppIcon::parse(&bytes))
++        })
++        .collect()
++}
++
 +/// Last polled MPRIS position, extrapolated at normal rate while playing.
 +#[derive(Clone, Copy, Debug)]
 +struct TrackClock {
@@ -268,7 +368,18 @@ index 90cead9..fb477fa 100644
  const fn wire_step(direction: StepDirection) -> WireStepDirection {
      match direction {
          StepDirection::Down => WireStepDirection::Down,
-@@ -1411,6 +1551,7 @@ mod tests {
+@@ -1230,7 +1444,9 @@ const fn action_key(action: StockAction) -> Option<KeyCode> {
+         | StockAction::StepVolume(_)
+         | StockAction::MediaPrevious
+         | StockAction::MediaPlayPause
+-        | StockAction::MediaNext => return None,
++        | StockAction::MediaNext
++        | StockAction::ToggleApps
++        | StockAction::LaunchApp(_) => return None,
+     })
+ }
+ 
+@@ -1411,6 +1627,7 @@ mod tests {
              volume: Some(61),
              muted: true,
              display_off: false,
@@ -276,7 +387,7 @@ index 90cead9..fb477fa 100644
          };
          session
              .set_desktop_state(state)
-@@ -1454,6 +1595,7 @@ mod tests {
+@@ -1454,6 +1671,7 @@ mod tests {
              volume: Some(42),
              muted: false,
              display_off: false,
@@ -284,7 +395,7 @@ index 90cead9..fb477fa 100644
          };
          session
              .set_desktop_state(state)
-@@ -1484,6 +1626,7 @@ mod tests {
+@@ -1484,6 +1702,7 @@ mod tests {
              volume: Some(50),
              muted: false,
              display_off: false,
@@ -292,8 +403,17 @@ index 90cead9..fb477fa 100644
          };
          session
              .set_desktop_state(state)
+@@ -2051,7 +2270,7 @@ mod tests {
+         )
+         .unwrap();
+         let mut interpreter = InputInterpreter::new(dimensions, stock).unwrap();
+-        let held = contact(1, 13, 8);
++        let held = contact(1, 20, 8);
+ 
+         interpreter
+             .ingest_at(&input(1, false, vec![held]), None, Duration::ZERO)
 diff --git a/crates/t1-touchbar/src/builtin_renderer/tests/display_power.rs b/crates/t1-touchbar/src/builtin_renderer/tests/display_power.rs
-index ea0757c..3776cef 100644
+index ea0757c..2d40296 100644
 --- a/crates/t1-touchbar/src/builtin_renderer/tests/display_power.rs
 +++ b/crates/t1-touchbar/src/builtin_renderer/tests/display_power.rs
 @@ -12,6 +12,7 @@ fn display_off_blanks_the_frame_and_drops_contacts_until_power_returns() {
@@ -312,8 +432,26 @@ index ea0757c..3776cef 100644
      };
      session
          .set_desktop_state(state)
+@@ -110,7 +112,7 @@ fn blanking_cancels_timer_actions_before_another_input_frame() {
+     let hardware = SeqPacketClient::new(hardware.as_fd());
+     let mut packet = vec![0; MAX_PACKET_LENGTH];
+     session
+-        .observe_input(input(1, false, vec![contact(1, 13, 8)]))
++        .observe_input(input(1, false, vec![contact(1, 20, 8)]))
+         .unwrap();
+     session
+         .advance(HOLD_REPEAT_DELAY, &connection, None)
+@@ -149,7 +151,7 @@ fn blanking_cancels_timer_actions_before_another_input_frame() {
+     assert!(outcome.actions.is_empty());
+     session.apply_pending_desktop_state().unwrap();
+     session
+-        .observe_input(input(3, false, vec![contact(2, 13, 8)]))
++        .observe_input(input(3, false, vec![contact(2, 20, 8)]))
+         .unwrap();
+     session
+         .advance(
 diff --git a/crates/t1-touchbar/src/desktop_provider.rs b/crates/t1-touchbar/src/desktop_provider.rs
-index 315fce7..85979f3 100644
+index 315fce7..567a791 100644
 --- a/crates/t1-touchbar/src/desktop_provider.rs
 +++ b/crates/t1-touchbar/src/desktop_provider.rs
 @@ -64,6 +64,20 @@ pub struct DesktopState {
@@ -337,7 +475,27 @@ index 315fce7..85979f3 100644
  }
  
  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-@@ -439,9 +453,14 @@ fn finish_status(status: ExitStatus, output: Vec<u8>) -> Result<Vec<u8>, Desktop
+@@ -75,6 +89,8 @@ pub enum DesktopAction {
+     MediaNext,
+     ShowDisplayBrightness,
+     ShowKeyboardBacklight,
++    /// Launches the application on this line of the provider's list.
++    LaunchApp(u8),
+ }
+ 
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+@@ -342,6 +358,10 @@ fn action_arguments(operation: ProviderOperation) -> Vec<OsString> {
+         ProviderOperation::Desktop(DesktopAction::ShowKeyboardBacklight) => {
+             arguments.push(OsString::from("show-keyboard-backlight"));
+         }
++        ProviderOperation::Desktop(DesktopAction::LaunchApp(index)) => {
++            arguments.push(OsString::from("launch-app"));
++            arguments.push(OsString::from(index.to_string()));
++        }
+         ProviderOperation::NotifyRendererFallback(reason) => {
+             arguments.push(OsString::from("notify-renderer-fallback"));
+             arguments.push(OsString::from(match reason {
+@@ -439,9 +459,14 @@ fn finish_status(status: ExitStatus, output: Vec<u8>) -> Result<Vec<u8>, Desktop
  
  fn parse_status(output: &[u8]) -> Result<DesktopState, DesktopProviderError> {
      let text = std::str::from_utf8(output).map_err(|_| DesktopProviderError::Status)?;
@@ -354,7 +512,7 @@ index 315fce7..85979f3 100644
              [magic, version, capabilities, volume, muted] => {
                  (*magic, *version, *capabilities, *volume, *muted, None)
              }
-@@ -490,12 +509,41 @@ fn parse_status(output: &[u8]) -> Result<DesktopState, DesktopProviderError> {
+@@ -490,12 +515,41 @@ fn parse_status(output: &[u8]) -> Result<DesktopState, DesktopProviderError> {
          (false, None) => false,
          _ => return Err(DesktopProviderError::Status),
      };
@@ -398,7 +556,7 @@ index 315fce7..85979f3 100644
  }
  
  fn parse_flag(field: &str) -> Result<bool, DesktopProviderError> {
-@@ -524,6 +572,7 @@ mod tests {
+@@ -524,6 +578,7 @@ mod tests {
                  volume: Some(42),
                  muted: true,
                  display_off: false,
@@ -406,7 +564,7 @@ index 315fce7..85979f3 100644
              })
          );
          assert_eq!(
-@@ -533,6 +582,7 @@ mod tests {
+@@ -533,6 +588,7 @@ mod tests {
                  volume: None,
                  muted: false,
                  display_off: false,
@@ -414,7 +572,7 @@ index 315fce7..85979f3 100644
              })
          );
      }
-@@ -546,6 +596,7 @@ mod tests {
+@@ -546,6 +602,7 @@ mod tests {
                  volume: Some(42),
                  muted: false,
                  display_off: true,
@@ -422,7 +580,7 @@ index 315fce7..85979f3 100644
              })
          );
          assert_eq!(
-@@ -555,6 +606,7 @@ mod tests {
+@@ -555,6 +612,7 @@ mod tests {
                  volume: None,
                  muted: false,
                  display_off: false,
@@ -430,7 +588,7 @@ index 315fce7..85979f3 100644
              })
          );
          for invalid in [
-@@ -568,6 +620,35 @@ mod tests {
+@@ -568,6 +626,35 @@ mod tests {
          }
      }
  
@@ -466,16 +624,66 @@ index 315fce7..85979f3 100644
      #[test]
      fn status_parser_rejects_ambiguous_or_unbounded_state() {
          for invalid in [
+diff --git a/crates/t1-touchbar/src/framebuffer.rs b/crates/t1-touchbar/src/framebuffer.rs
+index aa9389a..c47c3e3 100644
+--- a/crates/t1-touchbar/src/framebuffer.rs
++++ b/crates/t1-touchbar/src/framebuffer.rs
+@@ -290,6 +290,43 @@ impl<'pixels> Xrgb8888Frame<'pixels> {
+     }
+ }
+ 
++impl Xrgb8888Frame<'_> {
++    /// Alpha-blends a straight-alpha RGBA image over a positive in-bounds rectangle.
++    ///
++    /// # Errors
++    ///
++    /// Returns [`FramebufferError::RectangleOutOfBounds`] when the rectangle
++    /// is empty or outside the frame, or when `rgba` is not `width * height * 4`.
++    pub fn blend_rgba(&mut self, rectangle: Rectangle, rgba: &[u8]) -> Result<(), FramebufferError> {
++        let width = usize::try_from(rectangle.width).unwrap_or(0);
++        if rgba.len() != width * usize::try_from(rectangle.height).unwrap_or(0) * 4 {
++            return Err(FramebufferError::RectangleOutOfBounds);
++        }
++        for (row, line) in (0..rectangle.height).zip(rgba.chunks_exact(width * 4)) {
++            for (column, pixel) in (0..rectangle.width).zip(line.chunks_exact(4)) {
++                if pixel[3] == 0 {
++                    continue;
++                }
++                self.blend_mask(
++                    Rectangle {
++                        x: rectangle.x + column,
++                        y: rectangle.y + row,
++                        width: 1,
++                        height: 1,
++                    },
++                    &pixel[3..4],
++                    Rgb {
++                        red: pixel[0],
++                        green: pixel[1],
++                        blue: pixel[2],
++                    },
++                )?;
++            }
++        }
++        Ok(())
++    }
++}
++
+ fn blend_channel(background: u8, foreground: u8, alpha: u16) -> u8 {
+     let inverse = 255 - alpha;
+     u8::try_from((u16::from(background) * inverse + u16::from(foreground) * alpha + 127) / 255)
 diff --git a/crates/t1-touchbar/src/stock_art.rs b/crates/t1-touchbar/src/stock_art.rs
-index ad49165..ff515b0 100644
+index ad49165..e725bcb 100644
 --- a/crates/t1-touchbar/src/stock_art.rs
 +++ b/crates/t1-touchbar/src/stock_art.rs
-@@ -16,22 +16,50 @@ pub(crate) enum Symbol {
+@@ -16,22 +16,52 @@ pub(crate) enum Symbol {
      KeyboardUp,
      Previous,
      PlayPause,
 +    Play,
 +    Pause,
++    Apps,
++    Close,
      Next,
      Mute,
      VolumeDown,
@@ -526,7 +734,7 @@ index ad49165..ff515b0 100644
          let left = radius;
          let right = f64::from(width) - radius;
          let top = radius;
-@@ -44,8 +72,7 @@ pub(crate) fn draw_rounded_plate(
+@@ -44,8 +74,7 @@ pub(crate) fn draw_rounded_plate(
          let dx = x - center_x;
          let dy = y - center_y;
          dx * dx + dy * dy <= radius * radius
@@ -536,20 +744,75 @@ index ad49165..ff515b0 100644
  }
  
  pub(crate) fn draw_label(
-@@ -98,6 +125,8 @@ pub(crate) fn draw_symbol(
+@@ -85,6 +114,52 @@ pub(crate) fn draw_label_with_opacity(
+     )
+ }
+ 
++/// Full-color launcher icon (straight-alpha RGBA), loaded at runtime.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct AppIcon {
++    pub width: u32,
++    pub height: u32,
++    pub rgba: Vec<u8>,
++}
++
++impl AppIcon {
++    /// Parses `width:u32le height:u32le` followed by RGBA rows.
++    #[must_use]
++    pub fn parse(bytes: &[u8]) -> Option<Self> {
++        let width = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?);
++        let height = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?);
++        let rgba = bytes.get(8..)?.to_vec();
++        let valid = (1..=NATIVE_PLATE_HEIGHT).contains(&width)
++            && (1..=NATIVE_PLATE_HEIGHT).contains(&height)
++            && rgba.len() == usize::try_from(width * height * 4).ok()?;
++        valid.then_some(Self {
++            width,
++            height,
++            rgba,
++        })
++    }
++}
++
++/// Centers a launcher icon in `bounds`, skipped when it does not fit.
++pub(crate) fn draw_app_icon(
++    frame: &mut Xrgb8888Frame<'_>,
++    bounds: Rectangle,
++    icon: &AppIcon,
++) -> Result<(), FramebufferError> {
++    if icon.width > bounds.width || icon.height > bounds.height {
++        return Ok(());
++    }
++    frame.blend_rgba(
++        Rectangle {
++            x: bounds.x + (bounds.width - icon.width) / 2,
++            y: bounds.y + (bounds.height - icon.height) / 2,
++            width: icon.width,
++            height: icon.height,
++        },
++        &icon.rgba,
++    )
++}
++
+ pub(crate) fn draw_symbol(
+     frame: &mut Xrgb8888Frame<'_>,
+     bounds: Rectangle,
+@@ -98,6 +173,10 @@ pub(crate) fn draw_symbol(
          Symbol::KeyboardUp => stock_icons::KEYBOARD_UP,
          Symbol::Previous => stock_icons::PREVIOUS,
          Symbol::PlayPause => stock_icons::PLAY_PAUSE,
 +        Symbol::Play => stock_icons::PLAY,
 +        Symbol::Pause => stock_icons::PAUSE,
++        Symbol::Apps => stock_icons::APPS,
++        Symbol::Close => stock_icons::CLOSE,
          Symbol::Next => stock_icons::NEXT,
          Symbol::Mute => stock_icons::MUTE,
          Symbol::VolumeDown => stock_icons::VOLUME_DOWN,
 diff --git a/crates/t1-touchbar/src/stock_icons.rs b/crates/t1-touchbar/src/stock_icons.rs
-index 6e733d7..68cd7fa 100644
+index 6e733d7..e1559a4 100644
 --- a/crates/t1-touchbar/src/stock_icons.rs
 +++ b/crates/t1-touchbar/src/stock_icons.rs
-@@ -1,433 +1,508 @@
+@@ -1,433 +1,574 @@
 -//! Generated alpha masks from MIT-licensed Cupertino and Myna icon sources.
 +//! Generated alpha masks: Adwaita symbolic icons (CC BY-SA 3.0) and cairo-drawn
 +//! brightness glyphs, rendered at native Touch Bar size by `touchbar-icons.py`.
@@ -1429,16 +1692,101 @@ index 6e733d7..68cd7fa 100644
 +    height: 28,
 +    pixels: PAUSE_PIXELS,
 +};
++
++const APPS_PIXELS: &[u8] = &[
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 61, 102, 102, 61, 0, 0, 0, 0, 61, 102, 102, 61, 0, 0, 0, 0, 61, 102, 102, 61, 0, 0,
++    0, 61, 255, 255, 255, 255, 60, 0, 0, 61, 255, 255, 255, 255, 60, 0, 0, 61, 255, 255, 255, 255, 60, 0,
++    0, 102, 255, 255, 255, 255, 102, 0, 0, 102, 255, 255, 255, 255, 102, 0, 0, 102, 255, 255, 255, 255, 102, 0,
++    0, 102, 255, 255, 255, 255, 102, 0, 0, 102, 255, 255, 255, 255, 102, 0, 0, 102, 255, 255, 255, 255, 102, 0,
++    0, 61, 255, 255, 255, 255, 59, 0, 0, 61, 255, 255, 255, 255, 59, 0, 0, 61, 255, 255, 255, 255, 59, 0,
++    0, 0, 60, 102, 102, 59, 0, 0, 0, 0, 60, 102, 102, 59, 0, 0, 0, 0, 60, 102, 102, 59, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 61, 102, 102, 61, 0, 0, 0, 0, 61, 102, 102, 61, 0, 0, 0, 0, 61, 102, 102, 61, 0, 0,
++    0, 61, 255, 255, 255, 255, 60, 0, 0, 61, 255, 255, 255, 255, 60, 0, 0, 61, 255, 255, 255, 255, 60, 0,
++    0, 102, 255, 255, 255, 255, 102, 0, 0, 102, 255, 255, 255, 255, 102, 0, 0, 102, 255, 255, 255, 255, 102, 0,
++    0, 102, 255, 255, 255, 255, 102, 0, 0, 102, 255, 255, 255, 255, 102, 0, 0, 102, 255, 255, 255, 255, 102, 0,
++    0, 61, 255, 255, 255, 255, 59, 0, 0, 61, 255, 255, 255, 255, 59, 0, 0, 61, 255, 255, 255, 255, 59, 0,
++    0, 0, 60, 102, 102, 59, 0, 0, 0, 0, 60, 102, 102, 59, 0, 0, 0, 0, 60, 102, 102, 59, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 61, 102, 102, 61, 0, 0, 0, 0, 61, 102, 102, 61, 0, 0, 0, 0, 61, 102, 102, 61, 0, 0,
++    0, 61, 255, 255, 255, 255, 60, 0, 0, 61, 255, 255, 255, 255, 60, 0, 0, 61, 255, 255, 255, 255, 60, 0,
++    0, 102, 255, 255, 255, 255, 102, 0, 0, 102, 255, 255, 255, 255, 102, 0, 0, 102, 255, 255, 255, 255, 102, 0,
++    0, 102, 255, 255, 255, 255, 102, 0, 0, 102, 255, 255, 255, 255, 102, 0, 0, 102, 255, 255, 255, 255, 102, 0,
++    0, 61, 255, 255, 255, 255, 59, 0, 0, 61, 255, 255, 255, 255, 59, 0, 0, 61, 255, 255, 255, 255, 59, 0,
++    0, 0, 60, 102, 102, 59, 0, 0, 0, 0, 60, 102, 102, 59, 0, 0, 0, 0, 60, 102, 102, 59, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++];
++
++pub(crate) const APPS: AlphaMask = AlphaMask {
++    width: 24,
++    height: 24,
++    pixels: APPS_PIXELS,
++};
++
++const CLOSE_PIXELS: &[u8] = &[
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 167, 242, 87, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 87, 242, 167, 0, 0, 0, 0,
++    0, 0, 0, 0, 241, 255, 252, 89, 0, 0, 0, 0, 0, 0, 0, 0, 89, 252, 255, 241, 0, 0, 0, 0,
++    0, 0, 0, 0, 87, 252, 255, 252, 89, 0, 0, 0, 0, 0, 0, 89, 252, 255, 252, 87, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 85, 251, 255, 252, 92, 0, 0, 0, 0, 86, 251, 255, 252, 92, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 85, 251, 255, 252, 92, 0, 0, 86, 251, 255, 252, 92, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 85, 251, 255, 252, 92, 86, 251, 255, 252, 92, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 89, 252, 255, 252, 252, 255, 252, 89, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 89, 252, 255, 255, 252, 89, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 86, 251, 255, 255, 252, 92, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 89, 252, 255, 252, 252, 255, 252, 89, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 86, 251, 255, 252, 92, 85, 251, 255, 252, 92, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 86, 251, 255, 252, 92, 0, 0, 85, 251, 255, 252, 92, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 86, 251, 255, 252, 92, 0, 0, 0, 0, 85, 251, 255, 252, 92, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 87, 252, 255, 252, 89, 0, 0, 0, 0, 0, 0, 89, 252, 255, 252, 87, 0, 0, 0, 0,
++    0, 0, 0, 0, 241, 255, 252, 89, 0, 0, 0, 0, 0, 0, 0, 0, 89, 252, 255, 241, 0, 0, 0, 0,
++    0, 0, 0, 0, 167, 242, 87, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 87, 242, 167, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++];
++
++pub(crate) const CLOSE: AlphaMask = AlphaMask {
++    width: 24,
++    height: 24,
++    pixels: CLOSE_PIXELS,
++};
 diff --git a/crates/t1-touchbar/src/stock_slice.rs b/crates/t1-touchbar/src/stock_slice.rs
-index 4c0ae87..ade0b30 100644
+index 4c0ae87..863baa3 100644
 --- a/crates/t1-touchbar/src/stock_slice.rs
 +++ b/crates/t1-touchbar/src/stock_slice.rs
-@@ -13,27 +13,109 @@ const ACTIVE_RIGHT: u32 = NATIVE_WIDTH;
+@@ -4,36 +4,127 @@ use std::{error::Error, fmt};
+ 
+ use crate::framebuffer::{FramebufferError, Rectangle, Rgb, Xrgb8888Frame};
+ use crate::gesture::{DisplayContact, Gesture};
+-use crate::stock_art::{self, Symbol};
++use crate::stock_art::{self, AppIcon, Symbol};
+ use crate::stock_labels::{self, AlphaMask};
+ 
+ const NATIVE_WIDTH: u32 = 2_170;
+ const NATIVE_HEIGHT: u32 = 60;
+ const ACTIVE_RIGHT: u32 = NATIVE_WIDTH;
  const FUNCTION_SLOT_COUNT: u32 = 13;
++/// Normal row: a narrower escape, then the launcher key, then the controls.
++const NORMAL_ESCAPE_WIDTH: u32 = 140;
++const APPS_KEY_X: u32 = 148;
++const APPS_KEY_WIDTH: u32 = 102;
++/// Launcher page: icons share the span the controls use in the normal row.
++const APPS_AREA_X: u32 = 278;
  const PLATE_Y: u32 = 0;
  const PLATE_HEIGHT: u32 = 60;
 -const PLATE_RADIUS: u32 = 8;
-+const CAPSULE_RADIUS: u32 = 30;
++/// Corner radius close to the physical keycaps (was a 30 px pill).
++const CAPSULE_RADIUS: u32 = 10;
++/// Gauges keep clear of the plate edges whatever the radius.
++const GAUGE_MARGIN: u32 = 18;
 +const PRESSED_INSET: u32 = 4;
 +const SEPARATOR_INSET_Y: u32 = 16;
 +const SEPARATOR_WIDTH: u32 = 2;
@@ -1555,7 +1903,7 @@ index 4c0ae87..ade0b30 100644
  };
  
  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-@@ -90,6 +172,12 @@ pub struct StockLevels {
+@@ -90,6 +181,12 @@ pub struct StockLevels {
      pub keyboard_backlight: Option<u8>,
      pub volume: Option<u8>,
      pub muted: bool,
@@ -1568,7 +1916,88 @@ index 4c0ae87..ade0b30 100644
  }
  
  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-@@ -211,6 +299,9 @@ const NORMAL_CONTROLS: [NativeControl; 10] = [
+@@ -103,6 +200,10 @@ pub enum StockAction {
+     MediaPrevious,
+     MediaPlayPause,
+     MediaNext,
++    /// Opens or closes the launcher page.
++    ToggleApps,
++    /// Launches the configured application at this index.
++    LaunchApp(u8),
+ }
+ 
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+@@ -161,56 +262,59 @@ struct NativeControl {
+ const NORMAL_CONTROLS: [NativeControl; 10] = [
+     NativeControl {
+         control: Control::DisplayDown,
+-        x: 194,
+-        width: 182,
++        x: 278,
++        width: 176,
+     },
+     NativeControl {
+         control: Control::DisplayUp,
+-        x: 384,
+-        width: 182,
++        x: 462,
++        width: 176,
+     },
+     NativeControl {
+         control: Control::KeyboardDown,
+-        x: 602,
+-        width: 182,
++        x: 666,
++        width: 176,
+     },
+     NativeControl {
+         control: Control::KeyboardUp,
+-        x: 792,
+-        width: 182,
++        x: 850,
++        width: 176,
+     },
+     NativeControl {
+         control: Control::MediaPrevious,
+-        x: 1_010,
+-        width: 182,
++        x: 1_054,
++        width: 176,
+     },
+     NativeControl {
+         control: Control::MediaPlayPause,
+-        x: 1_200,
+-        width: 182,
++        x: 1_238,
++        width: 176,
+     },
+     NativeControl {
+         control: Control::MediaNext,
+-        x: 1_390,
+-        width: 182,
++        x: 1_422,
++        width: 176,
+     },
+     NativeControl {
+         control: Control::Mute,
+-        x: 1_608,
+-        width: 182,
++        x: 1_626,
++        width: 176,
+     },
+     NativeControl {
+         control: Control::VolumeDown,
+-        x: 1_798,
+-        width: 182,
++        x: 1_810,
++        width: 176,
+     },
+     NativeControl {
+         control: Control::VolumeUp,
+-        x: 1_988,
+-        width: 182,
++        x: 1_994,
++        width: 176,
      },
  ];
  
@@ -1578,13 +2007,114 @@ index 4c0ae87..ade0b30 100644
  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
  struct LaidOutControl {
      control: Control,
-@@ -328,23 +419,153 @@ impl StockBar {
+@@ -223,6 +327,8 @@ pub struct StockBar {
+     width: u32,
+     height: u32,
+     capabilities: StockCapabilities,
++    app_count: u8,
++    apps_open: bool,
+ }
+ 
+ impl StockBar {
+@@ -241,10 +347,27 @@ impl StockBar {
+                 width,
+                 height,
+                 capabilities,
++                app_count: 0,
++                apps_open: false,
+             })
+         }
+     }
+ 
++    /// Same bar with `count` launcher entries; the page opens only with entries.
++    #[must_use]
++    pub const fn with_apps(self, count: u8, open: bool) -> Self {
++        Self {
++            app_count: count,
++            apps_open: open && count > 0,
++            ..self
++        }
++    }
++
++    #[must_use]
++    pub const fn apps_open(self) -> bool {
++        self.apps_open
++    }
++
+     #[must_use]
+     pub const fn width(self) -> u32 {
+         self.width
+@@ -273,17 +396,18 @@ impl StockBar {
+         self.render_pressed(frame, fn_held, levels, None)
+     }
+ 
+-    /// Draws the fixed surface with an optional actively pressed control.
++    /// Draws the surface; `apps` supplies launcher icons by index.
+     ///
+     /// # Errors
+     ///
+     /// Rejects a changed frame geometry or an internally invalid draw.
+-    pub fn render_pressed(
++    pub fn render_with_apps(
+         self,
+         frame: &mut Xrgb8888Frame<'_>,
+         fn_held: bool,
+         levels: StockLevels,
+         pressed: Option<StockAction>,
++        apps: &[AppIcon],
+     ) -> Result<(), StockSliceError> {
+         if frame.width() != self.width || frame.height() != self.height {
+             return Err(StockSliceError::FrameGeometryMismatch);
+@@ -292,10 +416,25 @@ impl StockBar {
+         if fn_held {
+             self.render_function_row(frame, pressed)
+         } else {
+-            self.render_normal_row(frame, levels, pressed)
++            self.render_normal_row(frame, levels, pressed, apps)
+         }
+     }
+ 
++    /// Draws the fixed surface with an optional actively pressed control.
++    ///
++    /// # Errors
++    ///
++    /// Rejects a changed frame geometry or an internally invalid draw.
++    pub fn render_pressed(
++        self,
++        frame: &mut Xrgb8888Frame<'_>,
++        fn_held: bool,
++        levels: StockLevels,
++        pressed: Option<StockAction>,
++    ) -> Result<(), StockSliceError> {
++        self.render_with_apps(frame, fn_held, levels, pressed, &[])
++    }
++
+     /// Maps a completed tap to one currently visible action.
+     #[must_use]
+     pub fn action_for_gesture(self, gesture: Gesture, fn_held: bool) -> Option<StockAction> {
+@@ -319,6 +458,14 @@ impl StockBar {
+         if contains(self.escape_bounds(), x, y) {
+             return Some(StockAction::Escape);
+         }
++        if self.app_count > 0 && contains(self.apps_key_bounds(), x, y) {
++            return Some(StockAction::ToggleApps);
++        }
++        if self.apps_open {
++            return (0..self.app_count)
++                .find(|index| contains(self.app_slot(*index), x, y))
++                .map(StockAction::LaunchApp);
++        }
+         self.normal_controls()
+             .into_iter()
+             .find(|item| self.control_available(item.control) && contains(item.bounds, x, y))
+@@ -328,23 +475,209 @@ impl StockBar {
      fn render_normal_row(
          self,
          frame: &mut Xrgb8888Frame<'_>,
 -        _levels: StockLevels,
 +        levels: StockLevels,
          pressed: Option<StockAction>,
++        apps: &[AppIcon],
      ) -> Result<(), StockSliceError> {
 -        self.draw_plate(frame, self.escape_bounds(), StockAction::Escape, pressed)?;
 +        self.draw_plate(
@@ -1597,6 +2127,15 @@ index 4c0ae87..ade0b30 100644
          stock_art::draw_label(frame, self.escape_bounds(), stock_labels::ESC, LABEL)?;
 -        for item in self.normal_controls() {
 -            if !self.control_visible(item.control) {
++        if self.app_count > 0 {
++            let key = self.apps_key_bounds();
++            self.draw_plate(frame, key, CAPSULE_RADIUS, StockAction::ToggleApps, pressed)?;
++            let symbol = if self.apps_open { Symbol::Close } else { Symbol::Apps };
++            stock_art::draw_symbol(frame, key, symbol, LABEL)?;
++        }
++        if self.apps_open {
++            return self.render_apps(frame, pressed, apps);
++        }
 +        let controls = self.normal_controls();
 +        for (first, end) in CONTROL_GROUPS {
 +            let members: Vec<LaidOutControl> = controls[first..end]
@@ -1667,6 +2206,52 @@ index 4c0ae87..ade0b30 100644
          Ok(())
      }
  
++    /// Launcher page: one capsule, a separated slot per configured application.
++    fn render_apps(
++        self,
++        frame: &mut Xrgb8888Frame<'_>,
++        pressed: Option<StockAction>,
++        apps: &[AppIcon],
++    ) -> Result<(), StockSliceError> {
++        let first = self.app_slot(0);
++        let last = self.app_slot(self.app_count.saturating_sub(1));
++        stock_art::draw_gradient_plate(
++            frame,
++            Rectangle {
++                width: last.x + last.width - first.x,
++                ..first
++            },
++            self.scaled_y(CAPSULE_RADIUS).max(1),
++            PLATE_TOP,
++            PLATE_BOTTOM,
++        )?;
++        for index in 0..self.app_count {
++            let slot = self.app_slot(index);
++            if index > 0 {
++                self.draw_separator(frame, slot)?;
++            }
++            if pressed == Some(StockAction::LaunchApp(index)) {
++                let inset = self.scaled_y(PRESSED_INSET);
++                stock_art::draw_gradient_plate(
++                    frame,
++                    Rectangle {
++                        x: slot.x + inset,
++                        y: slot.y + inset,
++                        width: slot.width.saturating_sub(2 * inset).max(1),
++                        height: slot.height.saturating_sub(2 * inset).max(1),
++                    },
++                    self.scaled_y(CAPSULE_RADIUS - PRESSED_INSET).max(1),
++                    PRESSED_TOP,
++                    PRESSED_BOTTOM,
++                )?;
++            }
++            if let Some(icon) = apps.get(usize::from(index)) {
++                stock_art::draw_app_icon(frame, slot, icon)?;
++            }
++        }
++        Ok(())
++    }
++
 +    /// Level bar along the flat bottom edge of a capsule.
 +    fn draw_gauge(
 +        self,
@@ -1675,7 +2260,7 @@ index 4c0ae87..ade0b30 100644
 +        permille: u16,
 +        fill: Rgb,
 +    ) -> Result<Rectangle, StockSliceError> {
-+        let margin = self.scaled_y(CAPSULE_RADIUS);
++        let margin = self.scaled_x(GAUGE_MARGIN);
 +        let track = Rectangle {
 +            x: capsule.x + margin,
 +            y: capsule.y + self.scaled_y(GAUGE_Y),
@@ -1740,7 +2325,7 @@ index 4c0ae87..ade0b30 100644
      fn render_function_row(
          self,
          frame: &mut Xrgb8888Frame<'_>,
-@@ -356,7 +577,7 @@ impl StockBar {
+@@ -356,7 +689,7 @@ impl StockBar {
                  continue;
              }
              let action = function_action(slot).ok_or(StockSliceError::InvalidGeometry)?;
@@ -1749,7 +2334,7 @@ index 4c0ae87..ade0b30 100644
              stock_art::draw_label(frame, bounds, function_label(action)?, LABEL)?;
          }
          Ok(())
-@@ -366,19 +587,16 @@ impl StockBar {
+@@ -366,19 +699,16 @@ impl StockBar {
          self,
          frame: &mut Xrgb8888Frame<'_>,
          bounds: Rectangle,
@@ -1776,7 +2361,44 @@ index 4c0ae87..ade0b30 100644
          Ok(())
      }
  
-@@ -506,6 +724,55 @@ const fn control_action(control: Control) -> StockAction {
+@@ -397,7 +727,35 @@ impl StockBar {
+     }
+ 
+     fn escape_bounds(self) -> Rectangle {
+-        self.function_slot(0)
++        Rectangle {
++            width: self.scaled_x(NORMAL_ESCAPE_WIDTH).max(1),
++            ..self.function_slot(0)
++        }
++    }
++
++    fn apps_key_bounds(self) -> Rectangle {
++        Rectangle {
++            x: self.scaled_x(APPS_KEY_X),
++            y: self.scaled_y(PLATE_Y),
++            width: self.scaled_x(APPS_KEY_WIDTH).max(1),
++            height: self.scaled_y(PLATE_HEIGHT).max(1),
++        }
++    }
++
++    /// Equal slots across the launcher span; gaps are the separators' room.
++    fn app_slot(self, index: u8) -> Rectangle {
++        let left = self.scaled_x(APPS_AREA_X);
++        let span = self.active_right().saturating_sub(left);
++        let count = u32::from(self.app_count.max(1));
++        let start = left + ceiling_partition(u32::from(index), span, count);
++        let end = left + ceiling_partition(u32::from(index) + 1, span, count);
++        let gap = self.scaled_x(4);
++        Rectangle {
++            x: start + if index == 0 { 0 } else { gap },
++            y: self.scaled_y(PLATE_Y),
++            width: (end - start).saturating_sub(if index == 0 { 0 } else { gap }).max(1),
++            height: self.scaled_y(PLATE_HEIGHT).max(1),
++        }
+     }
+ 
+     fn function_slot(self, slot: u32) -> Rectangle {
+@@ -506,6 +864,55 @@ const fn control_action(control: Control) -> StockAction {
      }
  }
  
@@ -1832,7 +2454,16 @@ index 4c0ae87..ade0b30 100644
  const fn control_symbol(control: Control) -> Symbol {
      match control {
          Control::DisplayDown => Symbol::DisplayDown,
-@@ -682,7 +949,7 @@ mod tests {
+@@ -611,7 +1018,7 @@ mod tests {
+         assert_eq!(bar.escape_bounds().x, 0);
+         let items = bar.normal_controls();
+         assert_eq!(items.len(), 10);
+-        assert_eq!(items[0].bounds.x, 194);
++        assert_eq!(items[0].bounds.x, 278);
+         assert_eq!(items[9].bounds.x + items[9].bounds.width, NATIVE_WIDTH);
+         for item in items {
+             let action = bar.action_at(
+@@ -682,7 +1089,7 @@ mod tests {
          assert!(
              normal
                  .iter()

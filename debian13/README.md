@@ -20,7 +20,8 @@ t1bridge cible les kernels **7.x**. Deux modules ont dû être portés.
 | **Profils d'énergie** (CPU, turbo, secteur) | ✅ économie 1200 MHz, équilibré sans turbo, performance turbo ; secteur → équilibré | [`display/`](#écran-noir--gel--amdgpu-polaris) |
 | **Clavier** `@` / `<` inversés | ✅ `applespi iso_layout=1` | [`../keyboard/`](../keyboard/README.md) |
 | **Touch ID** (sudo, polkit, verrouillage, GDM) | ✅ 2 doigts, 3 essais avant le mot de passe, Touch Bar en français | [`touchid/`](#touch-id) |
-| **Touch Bar : volume / média** | ✅ fournisseur bureau GNOME + PipeWire, bulle OSD (extension) | [`touchbar/desktop-provider/`](#touch-bar--volume-sourdine-média) |
+| **Touch Bar : volume / média** | ✅ fournisseur bureau GNOME + PipeWire, jauges dans la Touch Bar | [`touchbar/desktop-provider/`](#touch-bar--volume-sourdine-média) |
+| **Touch Bar : look** | ✅ touches en capsules, icônes vectorielles, jauges, couleurs d'état | [`touchbar/`](#touch-bar--style-capsules-et-jauges) |
 | **Capteur de lumière ambiante** | ✅ déjà fonctionnel (luminosité auto GNOME) | [ici](#capteur-de-lumière-ambiante) |
 | **Modules T1 sous DKMS** | ✅ reconstruits à chaque nouveau kernel | [`dkms/`](#après-une-mise-à-jour-du-kernel--dkms) |
 | **Thunderbolt 3 : USB 3 des écrans** (Ethernet) | ✅ runtime PM désactivé sur les contrôleurs USB 3 Alpine Ridge | [ici](#thunderbolt-3--usb-3-des-écrans--docks-perdu-ethernet-etc) |
@@ -648,7 +649,8 @@ t1bridge ne fournit aucun contrôle de volume/média : il définit un contrat
 « **Desktop provider v1** » (`docs/interfaces.md`) — un exécutable utilisateur
 appelé par le renderer avec `v1 status | set-volume N | toggle-mute |
 media-previous | media-play-pause | media-next` (délai max 500 ms, sortie
-`T1BRIDGE-DESKTOP 1 <caps> <volume> <muet> [<écran>]`).
+`T1BRIDGE-DESKTOP 1 <caps> <volume> <muet> [<écran>]`, plus des champs `clé=valeur`
+facultatifs ajoutés par notre patch, voir [plus bas](#touch-bar--style-capsules-et-jauges)).
 
 [`touchbar/desktop-provider/t1-desktop-provider`](touchbar/desktop-provider/t1-desktop-provider)
 (bash, ~45 ms) :
@@ -670,37 +672,80 @@ Pièges :
 - `busctl --user list` coûte ~230 ms (introspection de chaque nom) : utiliser
   un seul `ListNames` pour trouver `org.mpris.MediaPlayer2.*`.
 
-### Bulle de niveau (OSD) pour volume et luminosités
+### Bulle de niveau (OSD) — retirée le 2026-11-10
 
-Les réglages faits **depuis la Touch Bar** n'affichaient aucune bulle GNOME
-(les touches physiques, elles, passent par gsd-media-keys). Or
-`org.gnome.Shell.ShowOSD` est **refusé** aux programmes extérieurs depuis
-GNOME 41 (`AccessDenied: ShowOSD is not allowed`).
+Avant les jauges, les réglages faits depuis la Touch Bar affichaient une bulle
+GNOME via une mini-extension,
+[`t1-osd@benoit`](touchbar/desktop-provider/t1-osd@benoit/extension.js)
+(`org.gnome.Shell.ShowOSD` est refusé aux programmes extérieurs depuis GNOME 41).
+Les niveaux sont maintenant dans la Touch Bar elle-même : le fournisseur
+n'appelle plus l'extension (conservée ici pour mémoire, désactivable).
 
-Solution : une mini-extension GNOME Shell,
-[`t1-osd@benoit`](touchbar/desktop-provider/t1-osd@benoit/extension.js), qui
-exporte sur le bus de session de gnome-shell une méthode
-`fr.benoit.T1Osd.Show(icône, niveau 0..1)` → `Main.osdWindowManager.show(-1, …)`
-(signature GNOME 48 : `show(monitorIndex, icon, label, level, maxLevel)`,
-`-1` = tous les écrans ; `showAll` n'existe pas en 48).
+Le fournisseur garde la capacité **8 (level feedback)** : après chaque cran de
+luminosité, le renderer appelle `show-display-brightness`, qui **recopie la
+valeur dans gsd-power** (propriété D-Bus `Brightness`). La Touch Bar règle
+l'écran via logind sans passer par GNOME : sans cette recopie, la luminosité
+automatique ignore le réglage et le défait quelques secondes plus tard.
 
-Le fournisseur annonce alors la capacité **8 (level feedback)** :
+## Touch Bar : style capsules et jauges
 
-| Action Touch Bar | Appel au fournisseur | Bulle |
-|---|---|---|
-| volume ± / curseur | `set-volume N` | icône muet/bas/moyen/haut + niveau réel (`wpctl get-volume`) |
-| sourdine | `toggle-mute` | idem |
-| luminosité écran | `show-display-brightness` (envoyé par le renderer après le réglage) | `gmux_backlight` |
-| luminosité clavier | `show-keyboard-backlight` | `spi::kbd_backlight` |
+![Aperçu de la Touch Bar](touchbar/apercu-touchbar.png)
 
-Les appels OSD sont « au mieux » (`|| true`) : si l'extension n'est pas
-chargée, l'action réussit quand même — un code de retour non nul rendrait le
-fournisseur indisponible pour le renderer.
+Le rendu d'origine de t1bridge (plaques grises plates, icônes bitmap) est
+remplacé par
+[`t1bridge-touchbar-capsules-jauges.patch`](touchbar/patches/t1bridge-touchbar-capsules-jauges.patch)
+(sur t1bridge `81cbdf8`, appliqué par `install-touchbar.sh`) :
 
-Installation :
-`cp -r t1-osd@benoit ~/.local/share/gnome-shell/extensions/`, l'ajouter à
-`org.gnome.shell enabled-extensions`, puis **se reconnecter** (sous Wayland,
-une nouvelle extension n'est détectée qu'au démarrage de la session).
+- **capsules** : touches regroupées par fonction (luminosité, clavier, média,
+  volume) dans une pilule, séparateurs fins, touche enfoncée en pilule plus
+  claire ; touches Fn en pilules ; léger dégradé vertical ;
+- **icônes** : Adwaita symboliques + soleils et rétroéclairage dessinés à la
+  taille native (2170×60, aucune mise à l'échelle) par
+  [`touchbar-icons.py`](touchbar/touchbar-icons.py)
+  (`python3 touchbar-icons.py apercu.png crates/t1-touchbar/src/stock_icons.rs`) ;
+- **jauges** sous luminosité écran, clavier et volume ; **barre d'avancement
+  verte** du morceau sous la capsule média ;
+- **couleurs d'état** (seulement pour un état, le reste reste gris) :
+
+  | Couleur | Signification |
+  |---|---|
+  | pilule verte sous ⏸ | lecture en cours (▶/⏸ selon MPRIS) |
+  | icône muet + jauge rouges | son coupé |
+  | icônes volume bleues | sortie casque (prise jack) ou Bluetooth |
+  | jauge volume orange | volume > 80 % |
+  | soleils orange | veilleuse GNOME active |
+  | icônes clavier ambre | rétroéclairage éteint |
+  | point au bout de la jauge luminosité | luminosité automatique désactivée |
+
+Les niveaux viennent du fournisseur : `status` ajoute en fin de ligne
+`play=0|1 pos=<ms> len=<ms> out=0|1 night=0|1 auto=0|1 disp=<%> kbd=<%>`
+(MPRIS en un seul `busctl` : `PlaybackStatus Position Metadata` ; sortie
+`bluez_output` ou contrôle ALSA `Headphone Jack` ; `NightLightActive` de
+gsd-color ; `ambient-enabled` lu par `dconf` ; `gmux_backlight`,
+`spi::kbd_backlight`). Le parseur patché lit ces extras (valeur inconnue ou
+hors bornes → refus) ; **le binaire t1bridge d'origine refuse la ligne entière**
+et ignore alors le fournisseur : avec l'ancien binaire, retirer `$extras` de
+l'`echo` du script.
+
+Fluidité (l'état n'est relu qu'une fois par seconde) :
+- appui luminosité/clavier → jauge avancée tout de suite de ~6 % (1 cran sur 16) ;
+- relevés du fournisseur ignorés 1,2 s après un appui local (un relevé en
+  retard faisait reculer la jauge pendant un appui maintenu) ;
+- la jauge glisse vers sa cible (un tiers de l'écart toutes les 16 ms, ~120 ms).
+
+- l'avancement du morceau est extrapolé par le renderer entre deux relevés
+  (horloge locale, recalé chaque seconde) : pas de relevé plus fréquent.
+
+Coût du fournisseur, appelé chaque seconde : en mode économie (CPU à 1,2 GHz),
+chaque processus lancé coûte 30-60 ms ; la 1re version (~10 processus, `awk`,
+`grep`…) prenait 300-550 ms, au bord du délai de 500 ms. Désormais : analyse en
+bash pur, 3 appels par seconde (`wpctl get-volume`, MPRIS, Mutter) et un cache
+de 5 s (`$XDG_RUNTIME_DIR/t1-desktop-provider.cache`) rafraîchi **en
+arrière-plan** (`flock -n … v1 refresh-cache`) pour le lecteur, la sortie, la
+veilleuse et la luminosité auto → ~150 ms en mode économie.
+
+Rendu d'une image : ~4 ms (release). Annuler : réinstaller le binaire d'origine
+(`git -C t1bridge checkout -- crates/t1-touchbar` puis rebuild).
 
 ## Écran de démarrage « pomme » (Plymouth)
 

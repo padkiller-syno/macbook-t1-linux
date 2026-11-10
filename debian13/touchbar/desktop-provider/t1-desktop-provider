@@ -1,15 +1,20 @@
 #!/bin/bash
 # Fournisseur bureau t1bridge (contrat « Desktop provider v1 ») pour GNOME + PipeWire.
 # Touch Bar : volume / sourdine (wpctl), média (MPRIS), extinction avec l'écran (Mutter),
-# bulle de niveau GNOME (extension t1-osd@benoit) pour volume, luminosité écran et clavier.
+# niveaux affichés par les jauges de la Touch Bar (plus de bulle GNOME depuis le 10/11).
 # Appelé par t1-touchbar avec : v1 <opération> [argument]   (délai max 500 ms)
+# `status` tourne chaque seconde : analyse en bash pur (en mode économie, chaque processus
+# lancé coûte 30-60 ms) et cache de 5 s pour ce qui change rarement.
 set -u
-export LC_ALL=C   # awk : point décimal (0.38), pas la virgule française
+export LC_ALL=C
 SINK=@DEFAULT_AUDIO_SINK@
+CACHE=${XDG_RUNTIME_DIR:-/tmp}/t1-desktop-provider.cache
+CACHE_TTL=5
 
 player() {  # premier lecteur MPRIS présent sur le bus de session
-  busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus ListNames 2>/dev/null \
-    | grep -o '"org\.mpris\.MediaPlayer2\.[^"]*"' | head -1 | tr -d '"'
+  local names
+  names=$(busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus ListNames 2>/dev/null)
+  [[ $names =~ \"(org\.mpris\.MediaPlayer2\.[^\"]*)\" ]] && echo "${BASH_REMATCH[1]}"
 }
 
 mpris() {  # mpris <Méthode>
@@ -17,43 +22,85 @@ mpris() {  # mpris <Méthode>
   busctl --user call "$p" /org/mpris/MediaPlayer2 org.mpris.MediaPlayer2.Player "$1" >/dev/null
 }
 
-osd() {  # osd <icône> <niveau 0..1> : bulle GNOME, sans jamais faire échouer l'action
-  busctl --user call org.gnome.Shell /fr/benoit/T1Osd fr.benoit.T1Osd Show sd "$1" "$2" >/dev/null 2>&1 || true
+percent() {  # percent <dossier backlight|leds> → PCT (vide si illisible), sans sous-shell
+  local b m; PCT=""
+  read -r b <"$1/brightness" 2>/dev/null && read -r m <"$1/max_brightness" 2>/dev/null || return 0
+  [ "$m" -gt 0 ] && PCT=$(( (b * 100 + m / 2) / m ))
+  return 0
 }
 
-osd_volume() {  # bulle volume d'après l'état réel de PipeWire
-  local v lvl icon
-  v=$(wpctl get-volume $SINK 2>/dev/null) || return 0
-  lvl=$(awk '{v=$2; if (v>1) v=1; print v}' <<<"$v")
-  if [[ $v == *MUTED* ]]; then icon=audio-volume-muted-symbolic; lvl=0
-  else icon=$(awk '{v=$1; print (v==0 ? "audio-volume-muted-symbolic" : v<0.34 ? "audio-volume-low-symbolic" : v<0.67 ? "audio-volume-medium-symbolic" : "audio-volume-high-symbolic")}' <<<"$lvl"); fi
-  osd "$icon" "$lvl"
+sync_gnome_brightness() {  # la Touch Bar règle l'écran via logind, sans passer par GNOME : sans cette
+  # recopie, la luminosité automatique (gsd-power) ignore le réglage et le défait au relevé suivant.
+  # Écrire la valeur dans gsd recale sa référence lux → % sur le choix de l'utilisateur.
+  percent "$1"; [ -n "$PCT" ] || return 0
+  busctl --user set-property org.gnome.SettingsDaemon.Power /org/gnome/SettingsDaemon/Power \
+    org.gnome.SettingsDaemon.Power.Screen Brightness i "$PCT" >/dev/null 2>&1 || true
 }
 
-osd_sysfs() {  # osd_sysfs <icône> <dossier backlight|leds>
-  local b m; b=$(cat "$2/brightness" 2>/dev/null) m=$(cat "$2/max_brightness" 2>/dev/null)
-  [ -n "$b" ] && [ -n "$m" ] && [ "$m" -gt 0 ] && osd "$1" "$(awk -v b="$b" -v m="$m" 'BEGIN{print b/m}')"
+refresh_cache() {  # valeurs lentes : lecteur MPRIS, sortie externe, veilleuse, luminosité auto
+  local out=0 night=- auto=1 nl
+  [[ $(wpctl inspect $SINK 2>/dev/null) == *'node.name = "bluez_output'* ]] && out=1
+  [ $out = 0 ] && [[ $(amixer -c PCH cget iface=CARD,name='Headphone Jack' 2>/dev/null) == *': values=on'* ]] && out=1
+  nl=$(busctl --user get-property org.gnome.SettingsDaemon.Color /org/gnome/SettingsDaemon/Color \
+       org.gnome.SettingsDaemon.Color NightLightActive 2>/dev/null)
+  case "$nl" in "b true") night=1 ;; "b false") night=0 ;; esac
+  # clé absente = valeur par défaut (activée)
+  [ "$(dconf read /org/gnome/settings-daemon/plugins/power/ambient-enabled 2>/dev/null)" = false ] && auto=0
+  printf '%s\n' "$EPOCHSECONDS" "$(player)" "$out" "$night" "$auto" >"$CACHE.$$" && mv -f "$CACHE.$$" "$CACHE"
+}
+
+status() {
+  local caps=$((1 + 8 + 16)) display=1   # 1 audio, 8 retour de niveau, 16 écran
+  local v num int frac vol muted=0 extras="" ts=0 p="" out=0 night=- auto=1 mp psm
+  v=$(wpctl get-volume $SINK 2>/dev/null) || exit 1   # « Volume: 0.23 [MUTED] »
+  num=${v#Volume: }; num=${num%% *}; int=${num%%.*}; frac=${num#*.}00; frac=${frac:0:2}
+  vol=$(( 10#$int * 100 + 10#$frac )); [ $vol -gt 100 ] && vol=100
+  [[ $v == *MUTED* ]] && muted=1
+
+  [ -r "$CACHE" ] && { read -r ts; read -r p; read -r out; read -r night; read -r auto; } <"$CACHE"
+  # rafraîchi en arrière-plan (~0,5 s en mode économie, au-delà du délai de 500 ms) :
+  # cet appel répond avec les valeurs du cache, même périmées ; flock évite les doublons.
+  if [ $(( EPOCHSECONDS - ts )) -ge $CACHE_TTL ]; then
+    flock -n "$CACHE.lock" "$0" v1 refresh-cache </dev/null >/dev/null 2>&1 &
+  fi
+
+  # champs facultatifs clé=valeur (renderer recompilé)
+  if [ -n "$p" ]; then
+    # un seul appel : état, position (µs), métadonnées (mpris:length en µs)
+    if mp=$(busctl --user get-property "$p" /org/mpris/MediaPlayer2 org.mpris.MediaPlayer2.Player \
+            PlaybackStatus Position Metadata 2>/dev/null); then
+      caps=$((caps + 2))
+      case "$mp" in *'"Playing"'*) extras+=" play=1" ;; *'"Paused"'*|*'"Stopped"'*) extras+=" play=0" ;; esac
+      if [[ $mp =~ $'\n'x\ ([0-9]+) ]]; then
+        local pos=${BASH_REMATCH[1]}
+        [[ $mp =~ \"mpris:length\"\ [xt]\ ([0-9]+) ]] && [ "${BASH_REMATCH[1]}" -gt 0 ] \
+          && extras+=" pos=$((pos / 1000)) len=$((BASH_REMATCH[1] / 1000))"
+      fi
+    else
+      rm -f "$CACHE"   # lecteur fermé : relire la liste au prochain appel
+    fi
+  fi
+  extras+=" out=$out auto=$auto"
+  [ "$night" != - ] && extras+=" night=$night"
+  percent /sys/class/backlight/gmux_backlight; [ -n "$PCT" ] && extras+=" disp=$PCT"
+  percent /sys/class/leds/spi::kbd_backlight; [ -n "$PCT" ] && extras+=" kbd=$PCT"
+
+  psm=$(busctl --user get-property org.gnome.Mutter.DisplayConfig /org/gnome/Mutter/DisplayConfig \
+        org.gnome.Mutter.DisplayConfig PowerSaveMode 2>/dev/null)
+  [ -n "$psm" ] && [ "${psm#i }" != 0 ] && display=0
+  echo "T1BRIDGE-DESKTOP 1 $caps $vol $muted $display$extras"
 }
 
 [ "${1:-}" = v1 ] || exit 2
 case "${2:-}" in
-  status)
-    caps=$((1 + 8 + 16)) display=1   # 1 audio, 8 retour de niveau, 16 écran
-    v=$(wpctl get-volume $SINK 2>/dev/null) || exit 1
-    vol=$(awk '{v=int($2*100+0.5); if (v>100) v=100; print v}' <<<"$v")
-    muted=0; [[ $v == *MUTED* ]] && muted=1
-    [ -n "$(player)" ] && caps=$((caps + 2))
-    psm=$(busctl --user get-property org.gnome.Mutter.DisplayConfig /org/gnome/Mutter/DisplayConfig \
-          org.gnome.Mutter.DisplayConfig PowerSaveMode 2>/dev/null | awk '{print $2}')
-    [ -n "$psm" ] && [ "$psm" != 0 ] && display=0
-    echo "T1BRIDGE-DESKTOP 1 $caps $vol $muted $display"
-    ;;
+  status) status ;;
+  refresh-cache) refresh_cache ;;   # interne, lancé en arrière-plan par status
   set-volume)
     [[ ${3:-} =~ ^[0-9]+$ ]] && [ "$3" -le 100 ] || exit 2
-    wpctl set-volume $SINK "$3%"; osd_volume ;;
-  toggle-mute)       wpctl set-mute $SINK toggle; osd_volume ;;
-  show-display-brightness) osd_sysfs display-brightness-symbolic /sys/class/backlight/gmux_backlight ;;
-  show-keyboard-backlight) osd_sysfs keyboard-brightness-symbolic /sys/class/leds/spi::kbd_backlight ;;
+    wpctl set-volume $SINK "$3%" ;;
+  toggle-mute)       wpctl set-mute $SINK toggle ;;
+  show-display-brightness) sync_gnome_brightness /sys/class/backlight/gmux_backlight ;;
+  show-keyboard-backlight) ;;   # rien à faire : la jauge de la Touch Bar suffit
   media-previous)    mpris Previous ;;
   media-play-pause)  mpris PlayPause ;;
   media-next)        mpris Next ;;

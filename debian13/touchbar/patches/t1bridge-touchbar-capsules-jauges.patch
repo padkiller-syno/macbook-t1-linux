@@ -1,0 +1,1843 @@
+diff --git a/crates/t1-touchbar/src/builtin_renderer.rs b/crates/t1-touchbar/src/builtin_renderer.rs
+index 90cead9..fb477fa 100644
+--- a/crates/t1-touchbar/src/builtin_renderer.rs
++++ b/crates/t1-touchbar/src/builtin_renderer.rs
+@@ -36,6 +36,11 @@ const RECEIVE_RETRY_DELAY: Duration = Duration::from_millis(5);
+ const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(50);
+ const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(2);
+ const VOLUME_STEP_PERCENT: u8 = 6;
++/// One of the 16 hardware brightness steps, for the optimistic gauge.
++const BRIGHTNESS_STEP_PERCENT: u8 = 6;
++/// After a local change, provider polls (up to 1 s stale) cannot roll levels back.
++const LOCAL_LEVEL_GRACE: Duration = Duration::from_millis(1_200);
++const GAUGE_EASE_INTERVAL: Duration = Duration::from_millis(16);
+ const HOLD_REPEAT_DELAY: Duration = Duration::from_millis(350);
+ const HOLD_REPEAT_INTERVAL: Duration = Duration::from_millis(90);
+ const OVERLAY_FADE_DURATION: Duration = Duration::from_millis(150);
+@@ -339,6 +344,10 @@ struct RendererSession {
+     pending_desktop_state: Option<DesktopState>,
+     display_off: bool,
+     levels: StockLevels,
++    shown_levels: StockLevels,
++    levels_grace_until: Duration,
++    gauge_last_update: Duration,
++    track: Option<TrackClock>,
+     touch_id: TouchIdOverlay,
+     overlay_state: Option<OverlayState>,
+     overlay_visual_state: Option<OverlayState>,
+@@ -390,6 +399,10 @@ impl RendererSession {
+             pending_desktop_state: None,
+             display_off: false,
+             levels: StockLevels::default(),
++            shown_levels: StockLevels::default(),
++            levels_grace_until: Duration::ZERO,
++            gauge_last_update: Duration::ZERO,
++            track: None,
+             touch_id,
+             overlay_state: None,
+             overlay_visual_state: None,
+@@ -636,6 +649,9 @@ impl RendererSession {
+         }
+         match action {
+             StockAction::StepDisplayBrightness(direction) => {
++                self.levels.display_brightness =
++                    step_level(self.levels.display_brightness, direction, BRIGHTNESS_STEP_PERCENT);
++                self.hold_local_levels();
+                 let feedback = self
+                     .desktop_state
+                     .capabilities
+@@ -648,6 +664,9 @@ impl RendererSession {
+                 )
+             }
+             StockAction::StepKeyboardBacklight(direction) => {
++                self.levels.keyboard_backlight =
++                    step_level(self.levels.keyboard_backlight, direction, BRIGHTNESS_STEP_PERCENT);
++                self.hold_local_levels();
+                 let feedback = self
+                     .desktop_state
+                     .capabilities
+@@ -661,7 +680,7 @@ impl RendererSession {
+             }
+             StockAction::ToggleMute => {
+                 self.levels.muted = !self.levels.muted;
+-                self.dirty = true;
++                self.hold_local_levels();
+                 dispatch_desktop(provider, DesktopAction::ToggleMute);
+                 Ok(())
+             }
+@@ -672,7 +691,7 @@ impl RendererSession {
+                     StepDirection::Up => current.saturating_add(VOLUME_STEP_PERCENT).min(100),
+                 };
+                 self.levels.volume = Some(value);
+-                self.dirty = true;
++                self.hold_local_levels();
+                 dispatch_desktop(provider, DesktopAction::SetVolume(value));
+                 Ok(())
+             }
+@@ -681,6 +700,8 @@ impl RendererSession {
+                 Ok(())
+             }
+             StockAction::MediaPlayPause => {
++                self.levels.playing = self.levels.playing.map(|playing| !playing);
++                self.hold_local_levels();
+                 dispatch_desktop(provider, DesktopAction::MediaPlayPause);
+                 Ok(())
+             }
+@@ -754,7 +775,17 @@ impl RendererSession {
+         .map_err(|_| BuiltinRendererError::Frame)?;
+         let fn_visible = self.input.fn_pressed() && self.overlay_visual_state.is_none();
+         self.stock
+-            .render_pressed(&mut frame, fn_visible, self.levels, self.input.pressed())
++            .render_pressed(
++                &mut frame,
++                fn_visible,
++                StockLevels {
++                    display_brightness: self.shown_levels.display_brightness,
++                    keyboard_backlight: self.shown_levels.keyboard_backlight,
++                    volume: self.shown_levels.volume,
++                    ..self.levels
++                },
++                self.input.pressed(),
++            )
+             .map_err(|_| BuiltinRendererError::Frame)?;
+         if self.overlay_opacity > 0 {
+             let left = self.stock.escape_right();
+@@ -832,6 +863,8 @@ impl RendererSession {
+         self.now = now;
+         self.advance_overlay_fade(now);
+         self.advance_enrollment_progress(now);
++        self.advance_track(now);
++        self.advance_gauges(now);
+         if !self.display_off
+             && !self.input.wait_for_touch_release
+             && let Some(action) = self.input.take_repeat(now)
+@@ -841,6 +874,44 @@ impl RendererSession {
+         self.submit_if_ready(connection)
+     }
+ 
++    /// Moves the track progress with the local clock between provider polls.
++    fn advance_track(&mut self, now: Duration) {
++        let playing = self.levels.playing == Some(true);
++        let progress = self.track.map(|track| track.permille(now, playing));
++        if self.levels.progress != progress {
++            self.levels.progress = progress;
++            self.dirty = true;
++        }
++    }
++
++    /// Eases displayed gauge levels toward their targets in a few frames.
++    fn advance_gauges(&mut self, now: Duration) {
++        if self.shown_levels == self.levels
++            || now.saturating_sub(self.gauge_last_update) < GAUGE_EASE_INTERVAL
++        {
++            return;
++        }
++        self.gauge_last_update = now;
++        self.shown_levels = StockLevels {
++            display_brightness: ease_level(
++                self.shown_levels.display_brightness,
++                self.levels.display_brightness,
++            ),
++            keyboard_backlight: ease_level(
++                self.shown_levels.keyboard_backlight,
++                self.levels.keyboard_backlight,
++            ),
++            volume: ease_level(self.shown_levels.volume, self.levels.volume),
++            ..self.levels
++        };
++        self.dirty = true;
++    }
++
++    fn hold_local_levels(&mut self) {
++        self.levels_grace_until = self.now + LOCAL_LEVEL_GRACE;
++        self.dirty = true;
++    }
++
+     fn advance_overlay_fade(&mut self, now: Duration) {
+         if self.overlay_opacity == self.overlay_target_opacity {
+             return;
+@@ -898,12 +969,13 @@ impl RendererSession {
+             }
+             self.dirty = true;
+         }
+-        if self.desktop_state == state && self.pending_desktop_state.is_none() {
+-            if self.levels.volume != state.volume || self.levels.muted != state.muted {
+-                self.levels.volume = state.volume;
+-                self.levels.muted = state.muted;
+-                self.dirty = true;
+-            }
++        // Levels never change the layout: adopt them at once, even mid-touch,
++        // so gauges follow a held brightness or volume key.
++        if self.desktop_state.capabilities == state.capabilities
++            && self.pending_desktop_state.is_none()
++        {
++            self.desktop_state = state;
++            self.adopt_levels(state);
+             return Ok(());
+         }
+         if !self.input.is_idle() {
+@@ -933,14 +1005,43 @@ impl RendererSession {
+         .map_err(|_| BuiltinRendererError::Negotiation)?;
+         self.stock = stock;
+         self.input.set_stock(stock);
+-        self.levels.volume = state.volume;
+-        self.levels.muted = state.muted;
++        self.adopt_levels(state);
+         self.desktop_state = state;
+         self.pending_desktop_state = None;
+         self.dirty = true;
+         Ok(())
+     }
+ 
++    fn adopt_levels(&mut self, state: DesktopState) {
++        self.track = match (state.track_position_ms, state.track_length_ms) {
++            (Some(position_ms), Some(length_ms)) if length_ms > 0 => Some(TrackClock {
++                position_ms,
++                length_ms,
++                at: self.now,
++            }),
++            _ => None,
++        };
++        self.levels.auto_brightness = state.auto_brightness;
++        if self.now < self.levels_grace_until {
++            return;
++        }
++        let levels = StockLevels {
++            display_brightness: state.display_brightness,
++            keyboard_backlight: state.keyboard_backlight,
++            volume: state.volume,
++            muted: state.muted,
++            playing: state.playing,
++            external_output: state.external_output,
++            night_light: state.night_light,
++            progress: self.levels.progress,
++            auto_brightness: state.auto_brightness,
++        };
++        if self.levels != levels {
++            self.levels = levels;
++            self.dirty = true;
++        }
++    }
++
+     fn allocate_request(&mut self, kind: PendingRequest) -> Result<u32, BuiltinRendererError> {
+         if self.pending.len() >= MAX_PENDING_REQUESTS {
+             return Err(BuiltinRendererError::Protocol);
+@@ -960,6 +1061,45 @@ impl RendererSession {
+     }
+ }
+ 
++/// Last polled MPRIS position, extrapolated at normal rate while playing.
++#[derive(Clone, Copy, Debug)]
++struct TrackClock {
++    position_ms: u64,
++    length_ms: u64,
++    at: Duration,
++}
++
++impl TrackClock {
++    fn permille(self, now: Duration, playing: bool) -> u16 {
++        let elapsed = if playing {
++            u64::try_from(now.saturating_sub(self.at).as_millis()).unwrap_or(u64::MAX)
++        } else {
++            0
++        };
++        let position = self.position_ms.saturating_add(elapsed).min(self.length_ms);
++        u16::try_from(position * 1_000 / self.length_ms).unwrap_or(1_000)
++    }
++}
++
++fn step_level(level: Option<u8>, direction: StepDirection, step: u8) -> Option<u8> {
++    level.map(|level| match direction {
++        StepDirection::Down => level.saturating_sub(step),
++        StepDirection::Up => level.saturating_add(step).min(100),
++    })
++}
++
++/// Moves a third of the remaining distance (at least one unit) per frame.
++fn ease_level(shown: Option<u8>, target: Option<u8>) -> Option<u8> {
++    match (shown, target) {
++        (Some(shown), Some(target)) if shown != target => {
++            let distance = i16::from(target) - i16::from(shown);
++            let next = i16::from(shown) + distance / 3 + distance.signum();
++            Some(u8::try_from(next).unwrap_or(target))
++        }
++        _ => target,
++    }
++}
++
+ const fn wire_step(direction: StepDirection) -> WireStepDirection {
+     match direction {
+         StepDirection::Down => WireStepDirection::Down,
+@@ -1411,6 +1551,7 @@ mod tests {
+             volume: Some(61),
+             muted: true,
+             display_off: false,
++            ..DesktopState::default()
+         };
+         session
+             .set_desktop_state(state)
+@@ -1454,6 +1595,7 @@ mod tests {
+             volume: Some(42),
+             muted: false,
+             display_off: false,
++            ..DesktopState::default()
+         };
+         session
+             .set_desktop_state(state)
+@@ -1484,6 +1626,7 @@ mod tests {
+             volume: Some(50),
+             muted: false,
+             display_off: false,
++            ..DesktopState::default()
+         };
+         session
+             .set_desktop_state(state)
+diff --git a/crates/t1-touchbar/src/builtin_renderer/tests/display_power.rs b/crates/t1-touchbar/src/builtin_renderer/tests/display_power.rs
+index ea0757c..3776cef 100644
+--- a/crates/t1-touchbar/src/builtin_renderer/tests/display_power.rs
++++ b/crates/t1-touchbar/src/builtin_renderer/tests/display_power.rs
+@@ -12,6 +12,7 @@ fn display_off_blanks_the_frame_and_drops_contacts_until_power_returns() {
+         volume: None,
+         muted: false,
+         display_off: true,
++        ..DesktopState::default()
+     };
+     session.set_desktop_state(off).expect("apply display off");
+     assert!(session.display_off);
+@@ -58,6 +59,7 @@ fn display_power_applies_under_an_active_touch_while_layout_waits() {
+         volume: Some(50),
+         muted: false,
+         display_off: true,
++        ..DesktopState::default()
+     };
+     session
+         .set_desktop_state(state)
+diff --git a/crates/t1-touchbar/src/desktop_provider.rs b/crates/t1-touchbar/src/desktop_provider.rs
+index 315fce7..85979f3 100644
+--- a/crates/t1-touchbar/src/desktop_provider.rs
++++ b/crates/t1-touchbar/src/desktop_provider.rs
+@@ -64,6 +64,20 @@ pub struct DesktopState {
+     /// True only while a provider advertising display power reports the
+     /// desktop display off. An absent or failed provider never blanks.
+     pub display_off: bool,
++    /// Optional `key=value` extras after the fixed fields: MPRIS playback
++    /// (`play=0|1`) and display/keyboard levels in percent (`disp=`, `kbd=`).
++    pub playing: Option<bool>,
++    pub display_brightness: Option<u8>,
++    pub keyboard_backlight: Option<u8>,
++    /// Sound goes to headphones or Bluetooth (`out=1`); GNOME Night Light is
++    /// currently tinting the screen (`night=1`).
++    pub external_output: bool,
++    pub night_light: bool,
++    /// MPRIS track position and length in milliseconds (`pos=`, `len=`).
++    pub track_position_ms: Option<u64>,
++    pub track_length_ms: Option<u64>,
++    /// GNOME automatic brightness (`auto=0|1`).
++    pub auto_brightness: Option<bool>,
+ }
+ 
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+@@ -439,9 +453,14 @@ fn finish_status(status: ExitStatus, output: Vec<u8>) -> Result<Vec<u8>, Desktop
+ 
+ fn parse_status(output: &[u8]) -> Result<DesktopState, DesktopProviderError> {
+     let text = std::str::from_utf8(output).map_err(|_| DesktopProviderError::Status)?;
+-    let fields: Vec<_> = text.split_ascii_whitespace().collect();
++    let tokens: Vec<_> = text.split_ascii_whitespace().collect();
++    let fixed = tokens
++        .iter()
++        .position(|token| token.contains('='))
++        .unwrap_or(tokens.len());
++    let (fields, extras) = tokens.split_at(fixed);
+     let (magic, version, capability_field, volume_field, muted_field, display_field) =
+-        match fields.as_slice() {
++        match fields {
+             [magic, version, capabilities, volume, muted] => {
+                 (*magic, *version, *capabilities, *volume, *muted, None)
+             }
+@@ -490,12 +509,41 @@ fn parse_status(output: &[u8]) -> Result<DesktopState, DesktopProviderError> {
+         (false, None) => false,
+         _ => return Err(DesktopProviderError::Status),
+     };
+-    Ok(DesktopState {
++    let mut state = DesktopState {
+         capabilities,
+         volume,
+         muted,
+         display_off,
+-    })
++        ..DesktopState::default()
++    };
++    for extra in extras {
++        match extra.split_once('=') {
++            Some(("play", value)) => state.playing = Some(parse_flag(value)?),
++            Some(("disp", value)) => state.display_brightness = Some(parse_percent(value)?),
++            Some(("kbd", value)) => state.keyboard_backlight = Some(parse_percent(value)?),
++            Some(("out", value)) => state.external_output = parse_flag(value)?,
++            Some(("night", value)) => state.night_light = parse_flag(value)?,
++            Some(("pos", value)) => state.track_position_ms = Some(parse_millis(value)?),
++            Some(("len", value)) => state.track_length_ms = Some(parse_millis(value)?),
++            Some(("auto", value)) => state.auto_brightness = Some(parse_flag(value)?),
++            _ => return Err(DesktopProviderError::Status),
++        }
++    }
++    Ok(state)
++}
++
++fn parse_millis(field: &str) -> Result<u64, DesktopProviderError> {
++    field
++        .parse::<u64>()
++        .map_err(|_| DesktopProviderError::Status)
++}
++
++fn parse_percent(field: &str) -> Result<u8, DesktopProviderError> {
++    field
++        .parse::<u8>()
++        .ok()
++        .filter(|value| *value <= 100)
++        .ok_or(DesktopProviderError::Status)
+ }
+ 
+ fn parse_flag(field: &str) -> Result<bool, DesktopProviderError> {
+@@ -524,6 +572,7 @@ mod tests {
+                 volume: Some(42),
+                 muted: true,
+                 display_off: false,
++                ..DesktopState::default()
+             })
+         );
+         assert_eq!(
+@@ -533,6 +582,7 @@ mod tests {
+                 volume: None,
+                 muted: false,
+                 display_off: false,
++                ..DesktopState::default()
+             })
+         );
+     }
+@@ -546,6 +596,7 @@ mod tests {
+                 volume: Some(42),
+                 muted: false,
+                 display_off: true,
++                ..DesktopState::default()
+             })
+         );
+         assert_eq!(
+@@ -555,6 +606,7 @@ mod tests {
+                 volume: None,
+                 muted: false,
+                 display_off: false,
++                ..DesktopState::default()
+             })
+         );
+         for invalid in [
+@@ -568,6 +620,35 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn status_parser_reads_optional_level_extras() {
++        assert_eq!(
++            parse_status(b"T1BRIDGE-DESKTOP 1 17 42 0 1 play=1 disp=55 kbd=0 out=1 night=1 pos=1500 len=180000 auto=0\n"),
++            Ok(DesktopState {
++                capabilities: DesktopCapabilities::AUDIO | DesktopCapabilities::DISPLAY_POWER,
++                volume: Some(42),
++                muted: false,
++                display_off: false,
++                playing: Some(true),
++                display_brightness: Some(55),
++                keyboard_backlight: Some(0),
++                external_output: true,
++                night_light: true,
++                track_position_ms: Some(1_500),
++                track_length_ms: Some(180_000),
++                auto_brightness: Some(false),
++            })
++        );
++        for invalid in [
++            b"T1BRIDGE-DESKTOP 1 1 42 0 disp=101".as_slice(),
++            b"T1BRIDGE-DESKTOP 1 1 42 0 play=2",
++            b"T1BRIDGE-DESKTOP 1 1 42 0 other=1",
++            b"T1BRIDGE-DESKTOP 1 1 42 kbd=3 0",
++        ] {
++            assert_eq!(parse_status(invalid), Err(DesktopProviderError::Status));
++        }
++    }
++
+     #[test]
+     fn status_parser_rejects_ambiguous_or_unbounded_state() {
+         for invalid in [
+diff --git a/crates/t1-touchbar/src/stock_art.rs b/crates/t1-touchbar/src/stock_art.rs
+index ad49165..ff515b0 100644
+--- a/crates/t1-touchbar/src/stock_art.rs
++++ b/crates/t1-touchbar/src/stock_art.rs
+@@ -16,22 +16,50 @@ pub(crate) enum Symbol {
+     KeyboardUp,
+     Previous,
+     PlayPause,
++    Play,
++    Pause,
+     Next,
+     Mute,
+     VolumeDown,
+     VolumeUp,
+ }
+ 
+-pub(crate) fn draw_rounded_plate(
++/// Rounded plate shaded from `top` to `bottom`, one blended row at a time.
++pub(crate) fn draw_gradient_plate(
+     frame: &mut Xrgb8888Frame<'_>,
+     bounds: Rectangle,
+     radius: u32,
+-    color: Rgb,
++    top: Rgb,
++    bottom: Rgb,
+ ) -> Result<(), FramebufferError> {
+-    let width = bounds.width;
+-    let height = bounds.height;
++    let mask = rounded_mask(bounds.width, bounds.height, radius);
++    let row_length = usize::try_from(bounds.width).unwrap_or(0);
++    let span = bounds.height.saturating_sub(1).max(1);
++    for (row, alpha) in (0..bounds.height).zip(mask.chunks_exact(row_length)) {
++        let mix = |from: u8, to: u8| {
++            let value = (u32::from(from) * (span - row) + u32::from(to) * row + span / 2) / span;
++            u8::try_from(value).unwrap_or(u8::MAX)
++        };
++        frame.blend_mask(
++            Rectangle {
++                y: bounds.y + row,
++                height: 1,
++                ..bounds
++            },
++            alpha,
++            Rgb {
++                red: mix(top.red, bottom.red),
++                green: mix(top.green, bottom.green),
++                blue: mix(top.blue, bottom.blue),
++            },
++        )?;
++    }
++    Ok(())
++}
++
++fn rounded_mask(width: u32, height: u32, radius: u32) -> Vec<u8> {
+     let radius = f64::from(radius.min(width / 2).min(height / 2));
+-    let mask = rasterize(width, height, |x, y| {
++    rasterize(width, height, |x, y| {
+         let left = radius;
+         let right = f64::from(width) - radius;
+         let top = radius;
+@@ -44,8 +72,7 @@ pub(crate) fn draw_rounded_plate(
+         let dx = x - center_x;
+         let dy = y - center_y;
+         dx * dx + dy * dy <= radius * radius
+-    });
+-    frame.blend_mask(bounds, &mask, color)
++    })
+ }
+ 
+ pub(crate) fn draw_label(
+@@ -98,6 +125,8 @@ pub(crate) fn draw_symbol(
+         Symbol::KeyboardUp => stock_icons::KEYBOARD_UP,
+         Symbol::Previous => stock_icons::PREVIOUS,
+         Symbol::PlayPause => stock_icons::PLAY_PAUSE,
++        Symbol::Play => stock_icons::PLAY,
++        Symbol::Pause => stock_icons::PAUSE,
+         Symbol::Next => stock_icons::NEXT,
+         Symbol::Mute => stock_icons::MUTE,
+         Symbol::VolumeDown => stock_icons::VOLUME_DOWN,
+diff --git a/crates/t1-touchbar/src/stock_icons.rs b/crates/t1-touchbar/src/stock_icons.rs
+index 6e733d7..68cd7fa 100644
+--- a/crates/t1-touchbar/src/stock_icons.rs
++++ b/crates/t1-touchbar/src/stock_icons.rs
+@@ -1,433 +1,508 @@
+-//! Generated alpha masks from MIT-licensed Cupertino and Myna icon sources.
++//! Generated alpha masks: Adwaita symbolic icons (CC BY-SA 3.0) and cairo-drawn
++//! brightness glyphs, rendered at native Touch Bar size by `touchbar-icons.py`.
+ 
+ use crate::stock_labels::AlphaMask;
+ 
+ const DISPLAY_DOWN_PIXELS: &[u8] = &[
+-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 136, 255, 136, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-    0, 4, 4, 0, 0, 0, 1, 0, 23, 255, 255, 255, 23, 0, 1, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-    0, 0, 0, 0, 0, 0, 0, 178, 255, 178, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 93, 102, 0,
+-    0, 0, 0, 1, 0, 4, 50, 4, 0, 1, 0, 0, 0, 0, 102, 93, 0, 0, 0, 0, 0, 3, 0, 85, 255, 255, 121, 0,
+-    4, 0, 0, 2, 2, 0, 2, 2, 0, 0, 4, 0, 121, 255, 255, 85, 0, 3, 0, 0, 4, 0, 110, 255, 255, 152, 0,
+-    4, 2, 3, 0, 0, 0, 0, 0, 3, 2, 4, 0, 152, 255, 255, 110, 0, 4, 0, 0, 1, 0, 6, 155, 167, 16, 0,
+-    5, 0, 0, 21, 64, 80, 64, 21, 0, 0, 5, 0, 16, 167, 155, 6, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 5, 0,
+-    22, 161, 243, 255, 255, 255, 243, 161, 22, 0, 5, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 3, 3, 5, 0,
+-    49, 238, 255, 255, 253, 252, 253, 255, 255, 238, 48, 0, 5, 3, 3, 1, 0, 0, 0, 0, 1, 0, 0, 0, 2,
+-    0, 24, 239, 255, 249, 254, 255, 255, 255, 254, 249, 255, 239, 24, 0, 2, 0, 0, 0, 1, 0, 1, 0, 0,
+-    1, 0, 3, 0, 166, 255, 249, 255, 255, 255, 255, 255, 255, 255, 249, 255, 166, 0, 3, 0, 0, 2, 0,
+-    2, 0, 23, 0, 0, 2, 0, 26, 247, 255, 254, 255, 255, 255, 255, 255, 255, 255, 254, 255, 246, 26,
+-    0, 2, 0, 0, 4, 0, 149, 255, 167, 0, 3, 0, 71, 255, 252, 255, 255, 255, 255, 255, 255, 255, 255,
+-    255, 252, 255, 71, 0, 4, 0, 141, 236, 122, 255, 255, 255, 38, 0, 0, 87, 255, 252, 255, 255,
+-    255, 255, 255, 255, 255, 255, 255, 252, 255, 87, 0, 0, 37, 255, 255, 255, 149, 255, 167, 0, 3,
+-    0, 71, 255, 252, 255, 255, 255, 255, 255, 255, 255, 255, 255, 252, 255, 71, 0, 2, 4, 192, 255,
+-    174, 0, 23, 0, 0, 2, 0, 26, 247, 255, 254, 255, 255, 255, 255, 255, 255, 255, 254, 255, 247,
+-    26, 0, 3, 0, 7, 49, 0, 1, 0, 0, 1, 0, 3, 0, 167, 255, 249, 255, 255, 255, 255, 255, 255, 255,
+-    249, 255, 167, 0, 3, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 2, 0, 27, 242, 255, 249, 255, 255, 255, 255,
+-    255, 249, 255, 242, 27, 0, 2, 0, 0, 1, 2, 1, 0, 0, 0, 1, 3, 3, 5, 0, 55, 245, 255, 255, 252,
+-    251, 252, 255, 255, 245, 55, 0, 5, 4, 4, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 5, 0, 30, 175, 251,
+-    255, 255, 255, 251, 175, 30, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 143, 156, 11, 0, 4, 0, 0,
+-    32, 80, 96, 80, 32, 0, 0, 5, 0, 16, 147, 111, 0, 0, 0, 0, 0, 4, 0, 125, 255, 255, 150, 0, 4, 2,
+-    3, 0, 0, 0, 0, 0, 3, 2, 3, 0, 171, 255, 255, 95, 0, 4, 0, 0, 3, 0, 100, 255, 255, 122, 0, 4, 0,
+-    0, 3, 2, 0, 2, 3, 0, 0, 3, 0, 165, 255, 255, 91, 0, 3, 0, 0, 0, 0, 0, 93, 102, 0, 0, 0, 0, 1,
+-    0, 4, 50, 3, 0, 1, 0, 1, 0, 10, 116, 87, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 178,
+-    255, 178, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 0, 0, 0, 1, 0, 23, 255, 255,
+-    255, 23, 0, 1, 0, 0, 1, 4, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 136, 255, 136, 0,
+-    2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 73, 73, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 247, 247, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 75, 158, 22, 0, 0, 0, 0, 247, 247, 0, 0, 0, 0, 22, 158, 75, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 160, 255, 211, 21, 0, 0, 0, 73, 73, 0, 0, 0, 21, 211,
++    255, 160, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 22, 211, 255, 156, 0, 0, 0, 0, 0, 0,
++    0, 0, 156, 255, 211, 22, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 22, 156, 67, 0, 0,
++    0, 0, 0, 0, 0, 0, 67, 156, 22, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 43, 176, 234, 234, 176, 43, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 54, 247, 255, 255, 255, 255, 247, 54, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 186, 255, 255, 255, 255, 255, 255, 186, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 74, 249, 255, 249, 74, 0, 0, 243, 255, 255, 255, 255, 255, 255, 243, 0, 0,
++    74, 249, 255, 249, 74, 0, 0, 0, 0, 0, 0, 74, 249, 255, 249, 74, 0, 0, 243, 255, 255, 255, 255, 255,
++    255, 243, 0, 0, 74, 249, 255, 249, 74, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 184, 255,
++    255, 255, 255, 255, 255, 184, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 51, 246, 255, 255, 255, 255, 246, 51, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 40, 173, 232, 232, 173, 40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 22, 156, 67, 0, 0, 0, 0, 0, 0, 0, 0, 67, 156, 22, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 22, 211, 255, 156, 0, 0, 0, 0, 0, 0, 0, 0, 156, 255,
++    211, 22, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 160, 255, 211, 21, 0, 0, 0, 73, 73, 0,
++    0, 0, 21, 211, 255, 160, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 75, 158, 22, 0, 0, 0,
++    0, 247, 247, 0, 0, 0, 0, 22, 158, 75, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 247, 247, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 73, 73, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+ ];
++
+ pub(crate) const DISPLAY_DOWN: AlphaMask = AlphaMask {
+-    width: 27,
+-    height: 27,
++    width: 28,
++    height: 28,
+     pixels: DISPLAY_DOWN_PIXELS,
+ };
+ 
+ const DISPLAY_UP_PIXELS: &[u8] = &[
+-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 110, 255, 104, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-    0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 3, 0, 175, 255, 160, 0, 4, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0,
+-    0, 2, 0, 0, 3, 0, 0, 0, 0, 3, 0, 168, 255, 153, 0, 4, 0, 0, 0, 0, 3, 0, 0, 2, 0, 0, 0, 0, 0, 2,
+-    0, 14, 21, 0, 4, 0, 0, 0, 3, 0, 177, 255, 162, 0, 4, 0, 0, 0, 4, 0, 21, 14, 0, 2, 0, 0, 0, 1,
+-    0, 14, 217, 241, 48, 0, 4, 0, 0, 3, 0, 116, 255, 106, 0, 3, 0, 0, 4, 0, 47, 240, 217, 14, 0, 1,
+-    0, 0, 1, 0, 21, 241, 255, 242, 48, 0, 3, 0, 0, 0, 1, 33, 1, 1, 0, 0, 3, 0, 48, 242, 255, 240,
+-    21, 0, 1, 0, 0, 0, 3, 0, 50, 245, 255, 243, 33, 0, 3, 3, 0, 0, 0, 0, 0, 3, 3, 0, 33, 242, 255,
+-    242, 47, 0, 3, 0, 0, 0, 0, 0, 4, 0, 57, 244, 251, 42, 0, 0, 0, 21, 64, 81, 64, 21, 0, 0, 0, 42,
+-    255, 242, 48, 0, 4, 0, 0, 0, 0, 0, 0, 0, 4, 0, 28, 30, 0, 0, 20, 159, 242, 255, 255, 255, 242,
+-    159, 20, 0, 0, 42, 33, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 44, 235, 255, 255, 253,
+-    252, 253, 255, 255, 235, 44, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 20, 235, 255,
+-    249, 254, 255, 255, 255, 254, 249, 255, 235, 20, 0, 3, 0, 0, 0, 0, 0, 0, 3, 3, 3, 3, 3, 0, 3,
+-    0, 159, 255, 249, 255, 255, 255, 255, 255, 255, 255, 249, 255, 159, 0, 3, 0, 3, 3, 3, 3, 3, 0,
+-    0, 0, 0, 0, 0, 0, 21, 242, 255, 254, 255, 255, 255, 255, 255, 255, 255, 254, 255, 242, 21, 0,
+-    0, 0, 0, 0, 0, 0, 105, 175, 168, 178, 116, 1, 0, 64, 255, 253, 255, 255, 255, 255, 255, 255,
+-    255, 255, 255, 253, 255, 64, 0, 1, 121, 178, 168, 175, 105, 255, 255, 255, 255, 255, 34, 0, 82,
+-    255, 252, 255, 255, 255, 255, 255, 255, 255, 255, 255, 252, 255, 82, 0, 35, 255, 255, 255, 255,
+-    255, 105, 175, 168, 178, 116, 1, 0, 64, 255, 253, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+-    253, 255, 64, 0, 1, 121, 178, 168, 175, 105, 0, 0, 0, 0, 0, 0, 0, 21, 242, 255, 254, 255, 255,
+-    255, 255, 255, 255, 255, 254, 255, 242, 21, 0, 0, 0, 0, 0, 0, 0, 3, 3, 3, 3, 3, 0, 3, 0, 160,
+-    255, 249, 255, 255, 255, 255, 255, 255, 255, 249, 255, 160, 0, 3, 0, 3, 3, 3, 3, 3, 0, 0, 0, 0,
+-    0, 0, 3, 0, 22, 238, 255, 249, 254, 255, 255, 255, 254, 249, 255, 238, 22, 0, 4, 0, 0, 0, 0, 0,
+-    0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 50, 243, 255, 255, 252, 251, 252, 255, 255, 243, 50, 0, 0, 0, 3,
+-    0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 28, 30, 0, 0, 28, 173, 251, 255, 255, 255, 251, 173, 28, 0, 0,
+-    41, 33, 0, 4, 0, 0, 0, 0, 0, 0, 0, 4, 0, 57, 244, 251, 42, 0, 0, 0, 32, 80, 98, 80, 32, 0, 0,
+-    0, 42, 255, 242, 48, 0, 4, 0, 0, 0, 0, 0, 3, 0, 50, 245, 255, 243, 33, 0, 4, 3, 0, 0, 0, 0, 0,
+-    3, 4, 0, 33, 242, 255, 242, 48, 0, 3, 0, 0, 0, 2, 0, 25, 244, 255, 242, 48, 0, 3, 0, 0, 1, 1,
+-    33, 1, 1, 0, 0, 3, 0, 51, 246, 255, 240, 21, 0, 1, 0, 0, 1, 0, 24, 222, 232, 49, 0, 4, 0, 0, 3,
+-    0, 116, 255, 106, 0, 3, 0, 0, 4, 0, 56, 251, 218, 14, 0, 1, 0, 0, 0, 1, 0, 9, 12, 0, 4, 0, 0,
+-    0, 3, 0, 177, 255, 162, 0, 4, 0, 0, 0, 4, 0, 31, 17, 0, 2, 0, 0, 0, 0, 0, 1, 0, 0, 3, 0, 0, 0,
+-    0, 3, 0, 168, 255, 153, 0, 4, 0, 0, 0, 0, 3, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0,
+-    3, 0, 175, 255, 160, 0, 4, 0, 0, 0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3,
+-    0, 110, 255, 104, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 133, 133, 1, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 45, 255, 255, 45, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 51, 255, 255, 51,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
++    51, 255, 255, 51, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 191, 236, 61, 0,
++    0, 0, 0, 0, 51, 255, 255, 51, 0, 0, 0, 0, 0, 61, 236, 191, 0, 0, 0, 0, 0, 0, 0, 2,
++    236, 255, 243, 61, 0, 0, 0, 0, 45, 255, 255, 45, 0, 0, 0, 0, 61, 243, 255, 236, 2, 0, 0, 0,
++    0, 0, 0, 0, 61, 243, 255, 243, 61, 0, 0, 0, 1, 133, 133, 1, 0, 0, 0, 61, 243, 255, 243, 61,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 61, 243, 255, 242, 19, 0, 0, 0, 0, 0, 0, 0, 0, 19, 242,
++    255, 243, 61, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 61, 242, 238, 18, 0, 0, 0, 0, 0, 0,
++    0, 0, 18, 238, 242, 61, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 19, 18, 0, 1, 96,
++    199, 246, 246, 199, 96, 1, 0, 18, 19, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 2, 166, 255, 255, 255, 255, 255, 255, 166, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 100, 255, 255, 255, 255, 255, 255, 255, 255, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    1, 45, 51, 51, 51, 45, 1, 0, 0, 200, 255, 255, 255, 255, 255, 255, 255, 255, 200, 0, 0, 1, 45, 51,
++    51, 51, 45, 1, 133, 255, 255, 255, 255, 255, 133, 0, 0, 244, 255, 255, 255, 255, 255, 255, 255, 255, 243, 0,
++    0, 133, 255, 255, 255, 255, 255, 133, 133, 255, 255, 255, 255, 255, 133, 0, 0, 243, 255, 255, 255, 255, 255, 255,
++    255, 255, 242, 0, 0, 133, 255, 255, 255, 255, 255, 133, 1, 45, 51, 51, 51, 45, 1, 0, 0, 200, 255, 255,
++    255, 255, 255, 255, 255, 255, 199, 0, 0, 1, 45, 51, 51, 51, 45, 1, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 98, 255, 255, 255, 255, 255, 255, 255, 255, 98, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 2, 163, 255, 255, 255, 255, 255, 255, 162, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 19, 18, 0, 1, 93, 195, 244, 244, 195, 93, 1, 0, 18, 19, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 61, 242, 238, 18, 0, 0, 0, 0, 0, 0, 0, 0, 18, 238,
++    242, 61, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 61, 243, 255, 242, 19, 0, 0, 0, 0, 0, 0,
++    0, 0, 19, 242, 255, 243, 61, 0, 0, 0, 0, 0, 0, 0, 0, 0, 61, 243, 255, 243, 61, 0, 0, 0,
++    1, 133, 133, 1, 0, 0, 0, 61, 243, 255, 243, 61, 0, 0, 0, 0, 0, 0, 0, 2, 236, 255, 243, 61,
++    0, 0, 0, 0, 45, 255, 255, 45, 0, 0, 0, 0, 61, 243, 255, 236, 2, 0, 0, 0, 0, 0, 0, 0,
++    191, 236, 61, 0, 0, 0, 0, 0, 51, 255, 255, 51, 0, 0, 0, 0, 0, 61, 236, 191, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 51, 255, 255, 51, 0, 0, 0, 0, 0, 0, 1, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 51, 255, 255, 51, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 45, 255, 255, 45,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    1, 133, 133, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+ ];
++
+ pub(crate) const DISPLAY_UP: AlphaMask = AlphaMask {
+-    width: 29,
+-    height: 29,
++    width: 28,
++    height: 28,
+     pixels: DISPLAY_UP_PIXELS,
+ };
+ 
+ const KEYBOARD_DOWN_PIXELS: &[u8] = &[
+-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 142, 255, 142, 0, 2, 0, 0, 0, 0, 0, 0, 0,
+-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 14, 239, 255,
+-    239, 14, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
+-    0, 0, 0, 1, 0, 17, 235, 255, 235, 18, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0,
+-    0, 0, 2, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 14, 243, 255, 243, 14, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+-    3, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 133, 252, 133,
+-    0, 2, 0, 0, 0, 0, 0, 0, 0, 3, 0, 6, 2, 0, 1, 0, 0, 0, 0, 0, 2, 0, 132, 250, 142, 0, 0, 1, 0, 0,
+-    0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 63, 230, 205, 26, 0, 1, 0, 0, 0, 1,
+-    0, 12, 250, 255, 255, 153, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3, 0,
+-    63, 254, 255, 255, 105, 0, 4, 0, 0, 0, 0, 2, 0, 142, 255, 245, 255, 92, 0, 4, 0, 0, 0, 0, 0, 0,
+-    0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 9, 233, 255, 255, 227, 25, 0, 2, 0, 0, 0, 0, 1, 0, 0, 152,
+-    255, 255, 80, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 6, 218, 255, 228, 34,
+-    0, 3, 0, 0, 0, 0, 0, 0, 1, 0, 0, 92, 81, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-    0, 0, 2, 0, 35, 114, 26, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 3, 0, 0,
+-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 4, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-    0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+-    0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 2, 0, 0, 0, 2, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-    0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 2, 0, 0, 0, 2, 0, 14, 17, 14, 0, 0, 0, 0, 0, 0, 0, 14,
+-    17, 16, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 16, 17, 14, 0, 0, 0, 0, 0, 0, 0, 14, 17,
+-    14, 0, 143, 240, 236, 245, 133, 0, 2, 0, 2, 0, 134, 245, 237, 238, 238, 238, 238, 238, 238,
+-    238, 238, 238, 238, 238, 238, 238, 237, 245, 133, 0, 2, 0, 2, 0, 134, 245, 236, 240, 143, 255,
+-    255, 255, 255, 247, 12, 0, 2, 0, 12, 248, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+-    255, 255, 255, 255, 255, 255, 255, 247, 12, 0, 2, 0, 12, 248, 255, 255, 255, 255, 152, 255,
+-    252, 255, 142, 0, 2, 0, 2, 0, 142, 255, 252, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254,
+-    254, 254, 254, 252, 255, 142, 0, 2, 0, 2, 0, 142, 255, 252, 255, 151,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 103, 103, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 19, 255, 255, 19,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 81, 18, 0, 0, 0, 0,
++    26, 255, 255, 26, 0, 0, 0, 0, 18, 81, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 105, 255, 207,
++    12, 0, 0, 0, 26, 255, 255, 26, 0, 0, 0, 12, 207, 255, 105, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 46, 246, 255, 176, 1, 0, 0, 6, 224, 224, 6, 0, 0, 1, 176, 255, 246, 46, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 87, 254, 255, 64, 0, 0, 0, 6, 6, 0, 0, 0, 64, 255, 254, 87, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 103, 164, 14, 0, 0, 0, 0, 0, 0, 0, 0, 14, 164,
++    103, 0, 0, 0, 0, 0, 0, 0, 0, 0, 106, 110, 43, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 43, 110, 106, 0, 0, 0, 40, 255, 255, 255, 225, 40, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 40, 225, 255, 255, 255, 40, 0, 0, 2, 133, 215, 255, 255, 77, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 77, 255, 255, 215, 133, 2, 0, 0, 0, 0, 0,
++    28, 54, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 54, 28, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 31, 188, 249, 255, 255, 255,
++    255, 255, 255, 255, 255, 255, 255, 249, 187, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 188, 255,
++    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 186, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 243, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 242, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 187, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 186, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 31, 186, 249, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 249,
++    185, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+ ];
++
+ pub(crate) const KEYBOARD_DOWN: AlphaMask = AlphaMask {
+-    width: 39,
+-    height: 19,
++    width: 28,
++    height: 28,
+     pixels: KEYBOARD_DOWN_PIXELS,
+ };
+ 
+ const KEYBOARD_UP_PIXELS: &[u8] = &[
+-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 142, 255, 142, 0, 2, 0, 0, 0, 0, 0, 0, 0,
+-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 14, 240, 255,
+-    240, 14, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-    0, 0, 0, 1, 0, 17, 237, 255, 237, 17, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-    0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 16, 237, 255, 237, 16, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+-    0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 17, 237, 255, 237,
+-    17, 0, 1, 0, 0, 0, 0, 0, 0, 1, 3, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 13, 0, 0, 4, 0, 0, 0, 0,
+-    0, 0, 1, 0, 16, 237, 255, 237, 16, 0, 1, 0, 0, 0, 0, 0, 3, 0, 0, 12, 0, 0, 1, 0, 0, 0, 0, 0, 2,
+-    0, 132, 247, 156, 9, 0, 4, 1, 0, 0, 0, 0, 1, 0, 17, 236, 255, 236, 17, 0, 1, 0, 0, 0, 0, 5, 0,
+-    0, 131, 244, 163, 0, 0, 1, 0, 0, 0, 1, 0, 12, 251, 255, 255, 224, 63, 0, 0, 3, 0, 0, 0, 1, 0,
+-    14, 244, 255, 244, 14, 0, 1, 0, 0, 2, 2, 0, 40, 203, 255, 255, 255, 42, 0, 2, 0, 0, 0, 0, 2, 0,
+-    134, 255, 254, 255, 255, 135, 0, 0, 2, 0, 0, 0, 2, 0, 133, 252, 133, 0, 2, 0, 0, 2, 0, 0, 107,
+-    252, 255, 251, 255, 167, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 84, 241, 255, 250, 255, 206, 36, 0, 2,
+-    0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 1, 0, 17, 179, 255, 252, 255, 255, 113, 0, 0, 1, 0, 0, 0, 0, 0,
+-    0, 0, 3, 0, 24, 183, 255, 250, 255, 209, 0, 0, 0, 0, 0, 0, 2, 0, 2, 0, 0, 0, 3, 0, 172, 255,
+-    247, 255, 208, 44, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 110, 249, 255, 192, 0, 1, 0, 0,
+-    0, 0, 0, 1, 0, 0, 0, 0, 3, 0, 155, 255, 255, 139, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-    2, 2, 0, 43, 111, 22, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 9, 104, 61, 0, 0, 3, 0, 0, 0,
+-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
+-    0, 3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 4, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-    0, 0, 0, 0, 0, 1, 4, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0,
+-    0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 2, 0, 0, 0, 0, 0, 0,
+-    0, 2, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 2,
+-    0, 14, 17, 16, 17, 16, 17, 14, 0, 0, 0, 0, 0, 0, 0, 14, 17, 16, 17, 17, 17, 16, 17, 14, 0, 0,
+-    0, 0, 0, 0, 0, 14, 17, 16, 17, 16, 17, 14, 0, 143, 241, 238, 238, 238, 238, 237, 245, 133, 0,
+-    2, 0, 2, 0, 134, 245, 237, 238, 238, 238, 238, 238, 237, 245, 133, 0, 2, 0, 2, 0, 134, 245,
+-    237, 238, 238, 238, 238, 241, 143, 255, 255, 255, 255, 255, 255, 255, 255, 247, 12, 0, 2, 0,
+-    12, 248, 255, 255, 255, 255, 255, 255, 255, 255, 255, 247, 12, 0, 2, 0, 12, 248, 255, 255, 255,
+-    255, 255, 255, 255, 255, 152, 255, 253, 254, 254, 254, 252, 255, 142, 0, 2, 0, 2, 0, 142, 255,
+-    252, 254, 254, 254, 254, 254, 252, 255, 142, 0, 2, 0, 2, 0, 142, 255, 252, 254, 254, 254, 253,
+-    255, 151,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 6, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 6, 224, 224, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 26, 255, 255, 26, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 26, 255, 255, 26, 0, 0, 0, 0, 0, 0, 0, 4,
++    0, 0, 0, 0, 0, 0, 0, 131, 249, 86, 0, 0, 0, 0, 0, 0, 26, 255, 255, 26, 0, 0, 0, 0,
++    0, 0, 86, 249, 131, 0, 0, 0, 0, 0, 0, 148, 255, 246, 55, 0, 0, 0, 0, 0, 26, 255, 255, 26,
++    0, 0, 0, 0, 0, 55, 246, 255, 148, 0, 0, 0, 0, 0, 0, 9, 202, 255, 231, 30, 0, 0, 0, 0,
++    26, 255, 255, 26, 0, 0, 0, 0, 26, 228, 255, 207, 12, 0, 0, 0, 0, 0, 0, 0, 26, 228, 255, 207,
++    12, 0, 0, 0, 26, 255, 255, 26, 0, 0, 0, 10, 203, 255, 231, 29, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 54, 246, 255, 176, 1, 0, 0, 6, 224, 224, 6, 0, 0, 1, 176, 255, 246, 54, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 87, 254, 255, 64, 0, 0, 0, 6, 6, 0, 0, 0, 64, 255, 254, 87, 0, 0,
++    0, 0, 0, 0, 61, 5, 0, 0, 0, 0, 0, 103, 164, 14, 0, 0, 0, 0, 0, 0, 0, 0, 14, 164,
++    103, 0, 0, 0, 0, 0, 5, 61, 255, 243, 179, 111, 43, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 43, 111, 179, 243, 255, 251, 255, 255, 255, 255, 225, 40, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 40, 225, 255, 255, 255, 255, 251, 14, 78, 147, 215, 255, 255, 77, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 77, 255, 255, 215, 147, 78, 14, 0, 0, 0, 0,
++    28, 54, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 54, 28, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 31, 188, 249, 255, 255, 255,
++    255, 255, 255, 255, 255, 255, 255, 249, 187, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 188, 255,
++    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 186, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 243, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 242, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 187, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 186, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 31, 186, 249, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 249,
++    185, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+ ];
++
+ pub(crate) const KEYBOARD_UP: AlphaMask = AlphaMask {
+-    width: 39,
+-    height: 21,
++    width: 28,
++    height: 28,
+     pixels: KEYBOARD_UP_PIXELS,
+ };
+ 
+ const PREVIOUS_PIXELS: &[u8] = &[
+-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 4, 0, 0, 115, 221, 240, 90, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0,
+-    0, 2, 4, 0, 0, 115, 224, 233, 92, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 5, 0, 0, 66, 206, 255, 255,
+-    255, 222, 2, 0, 1, 0, 0, 0, 0, 0, 0, 1, 5, 0, 0, 67, 207, 255, 255, 255, 237, 0, 0, 0, 0, 0, 0,
+-    0, 0, 4, 0, 0, 29, 169, 255, 255, 252, 253, 255, 238, 18, 0, 1, 0, 0, 0, 0, 0, 4, 0, 0, 32,
+-    171, 255, 255, 252, 254, 254, 255, 0, 0, 0, 0, 0, 0, 2, 3, 0, 2, 122, 247, 255, 253, 252, 255,
+-    254, 255, 238, 17, 0, 1, 0, 0, 0, 3, 3, 0, 4, 126, 249, 255, 253, 252, 255, 255, 255, 255, 0,
+-    0, 0, 0, 1, 5, 0, 0, 76, 217, 255, 255, 251, 255, 255, 255, 254, 255, 238, 17, 0, 1, 0, 1, 5,
+-    0, 0, 81, 221, 255, 255, 251, 255, 255, 255, 255, 255, 255, 0, 0, 0, 4, 0, 0, 37, 178, 255,
+-    255, 250, 254, 255, 255, 255, 255, 254, 255, 238, 17, 0, 1, 4, 0, 0, 42, 183, 255, 255, 250,
+-    254, 255, 255, 255, 255, 255, 255, 255, 0, 3, 2, 0, 7, 132, 252, 255, 252, 253, 255, 255, 255,
+-    255, 255, 255, 254, 255, 238, 17, 0, 3, 0, 11, 140, 255, 255, 252, 253, 255, 255, 255, 255,
+-    255, 255, 255, 255, 255, 4, 0, 0, 86, 225, 255, 255, 251, 255, 255, 255, 255, 255, 255, 255,
+-    255, 254, 255, 238, 21, 0, 0, 95, 231, 255, 255, 251, 255, 255, 255, 255, 255, 255, 255, 255,
+-    255, 255, 255, 0, 41, 188, 255, 255, 250, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+-    254, 255, 239, 3, 47, 197, 255, 255, 250, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+-    255, 255, 255, 87, 255, 255, 251, 253, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+-    254, 255, 226, 118, 255, 255, 251, 253, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+-    255, 255, 255, 246, 255, 251, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+-    255, 255, 250, 255, 255, 251, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+-    255, 255, 255, 243, 255, 250, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+-    255, 255, 249, 255, 255, 251, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+-    255, 255, 255, 74, 245, 255, 252, 252, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+-    254, 255, 227, 106, 252, 255, 252, 253, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+-    255, 255, 255, 0, 28, 172, 255, 255, 250, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+-    254, 255, 240, 3, 32, 182, 255, 255, 250, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+-    255, 255, 255, 4, 0, 0, 71, 214, 255, 255, 251, 255, 255, 255, 255, 255, 255, 255, 255, 254,
+-    255, 238, 21, 0, 0, 79, 220, 255, 255, 251, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+-    255, 0, 2, 4, 0, 0, 118, 246, 255, 253, 252, 255, 255, 255, 255, 255, 255, 254, 255, 238, 17,
+-    0, 4, 0, 4, 126, 250, 255, 252, 252, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 4,
+-    0, 0, 28, 167, 255, 255, 250, 254, 255, 255, 255, 255, 254, 255, 238, 17, 0, 1, 4, 0, 0, 33,
+-    173, 255, 255, 250, 254, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0, 1, 5, 0, 0, 68, 211,
+-    255, 255, 251, 255, 255, 255, 254, 255, 238, 17, 0, 1, 0, 1, 5, 0, 0, 73, 215, 255, 255, 251,
+-    255, 255, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0, 2, 4, 0, 0, 115, 245, 255, 253, 252, 255, 254,
+-    255, 238, 17, 0, 1, 0, 0, 0, 2, 3, 0, 1, 119, 246, 255, 253, 252, 255, 255, 255, 255, 0, 0, 0,
+-    0, 0, 0, 0, 0, 4, 0, 0, 26, 165, 255, 255, 252, 253, 255, 238, 18, 0, 1, 0, 0, 0, 0, 0, 4, 0,
+-    0, 28, 167, 255, 255, 252, 254, 254, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 5, 0, 0, 64, 205, 255,
+-    255, 255, 220, 1, 0, 1, 0, 0, 0, 0, 0, 0, 1, 5, 0, 0, 65, 206, 255, 255, 255, 234, 0, 0, 0, 0,
+-    0, 0, 0, 0, 0, 0, 0, 2, 4, 0, 0, 117, 225, 239, 87, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 4, 0,
+-    0, 118, 228, 232, 88,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 104, 119, 104, 3, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 86, 115, 37, 0, 0, 0, 56, 255, 255, 255, 56, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 83, 221, 255, 255, 242, 23, 0, 0, 64, 255, 255,
++    255, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 49, 192, 255, 255, 255, 255, 255, 63, 0,
++    0, 64, 255, 255, 255, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 20, 145, 252, 255, 255, 255, 255,
++    255, 255, 64, 0, 0, 64, 255, 255, 255, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 111, 241, 255, 255,
++    255, 255, 255, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 64, 0, 0, 0, 0, 0, 0, 0, 0, 77, 220,
++    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 64, 0, 0, 0, 0, 0, 0,
++    49, 192, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 64, 0, 0,
++    0, 0, 19, 145, 252, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 64, 255, 255,
++    255, 64, 0, 0, 5, 111, 240, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 64, 0,
++    0, 64, 255, 255, 255, 64, 0, 27, 217, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++    255, 255, 64, 0, 0, 64, 255, 255, 255, 64, 0, 120, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++    255, 255, 255, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 64, 0, 119, 255, 255, 255, 255, 255, 255, 255, 255,
++    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 64, 0, 26, 217, 255, 255, 255,
++    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 64, 0, 0,
++    5, 111, 240, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 64, 255, 255,
++    255, 64, 0, 0, 0, 0, 19, 145, 252, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 64, 0,
++    0, 64, 255, 255, 255, 64, 0, 0, 0, 0, 0, 0, 42, 184, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++    255, 255, 64, 0, 0, 64, 255, 255, 255, 64, 0, 0, 0, 0, 0, 0, 0, 0, 77, 220, 255, 255, 255, 255,
++    255, 255, 255, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5,
++    111, 240, 255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 64, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 19, 145, 252, 255, 255, 255, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 64, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 49, 192, 255, 255, 255, 255, 255, 63, 0, 0, 56, 255, 255,
++    255, 56, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 83, 221, 255, 255, 242, 23, 0,
++    0, 3, 110, 136, 110, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 86,
++    119, 37, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+ ];
++
+ pub(crate) const PREVIOUS: AlphaMask = AlphaMask {
+-    width: 38,
+-    height: 22,
++    width: 28,
++    height: 28,
+     pixels: PREVIOUS_PIXELS,
+ };
+ 
+ const PLAY_PAUSE_PIXELS: &[u8] = &[
+-    15, 133, 129, 24, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 9, 184, 246, 239, 239,
+-    246, 176, 5, 1, 0, 47, 222, 242, 240, 240, 241, 131, 183, 255, 255, 236, 110, 0, 0, 3, 2, 0, 0,
+-    0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 75, 255, 255, 255, 255, 255, 255, 63, 0, 0, 146, 255, 253, 255,
+-    255, 255, 254, 255, 253, 251, 255, 255, 212, 69, 0, 0, 5, 1, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 86,
+-    255, 251, 254, 254, 252, 255, 74, 0, 0, 155, 255, 251, 254, 255, 254, 255, 254, 255, 255, 254,
+-    251, 255, 255, 171, 33, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 4, 0, 84, 255, 252, 255, 255, 253, 255,
+-    72, 0, 0, 154, 255, 251, 255, 255, 255, 255, 255, 255, 255, 255, 255, 252, 253, 255, 250, 128,
+-    5, 0, 3, 3, 0, 0, 0, 0, 0, 4, 0, 84, 255, 252, 255, 255, 253, 255, 73, 0, 0, 154, 255, 251,
+-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 251, 255, 255, 222, 84, 0, 0, 4, 1, 0,
+-    0, 0, 4, 0, 84, 255, 252, 255, 255, 253, 255, 73, 0, 0, 154, 255, 251, 255, 255, 255, 255, 255,
+-    255, 255, 255, 255, 255, 255, 255, 254, 250, 255, 255, 186, 44, 0, 0, 4, 0, 0, 4, 0, 84, 255,
+-    252, 255, 255, 253, 255, 73, 0, 0, 154, 255, 251, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+-    255, 255, 255, 255, 255, 253, 252, 255, 255, 143, 13, 0, 1, 1, 3, 0, 84, 255, 252, 255, 255,
+-    253, 255, 73, 0, 0, 154, 255, 251, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+-    255, 255, 255, 255, 251, 255, 255, 233, 98, 0, 0, 5, 0, 84, 255, 252, 255, 255, 253, 255, 73,
+-    0, 0, 154, 255, 251, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+-    255, 255, 254, 250, 255, 255, 179, 3, 2, 0, 84, 255, 252, 255, 255, 253, 255, 73, 0, 0, 154,
+-    255, 251, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+-    255, 255, 253, 248, 255, 104, 0, 0, 84, 255, 252, 255, 255, 253, 255, 73, 0, 0, 154, 255, 251,
+-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+-    253, 248, 255, 104, 0, 0, 84, 255, 252, 255, 255, 253, 255, 73, 0, 0, 154, 255, 251, 255, 255,
+-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 254, 250, 255, 255,
+-    179, 3, 2, 0, 84, 255, 252, 255, 255, 253, 255, 73, 0, 0, 154, 255, 251, 255, 255, 255, 255,
+-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 251, 255, 255, 233, 98, 0, 0, 5, 0,
+-    84, 255, 252, 255, 255, 253, 255, 73, 0, 0, 154, 255, 251, 255, 255, 255, 255, 255, 255, 255,
+-    255, 255, 255, 255, 255, 255, 255, 253, 252, 255, 255, 143, 14, 0, 1, 1, 3, 0, 84, 255, 252,
+-    255, 255, 253, 255, 73, 0, 0, 154, 255, 251, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+-    255, 255, 254, 250, 255, 255, 186, 44, 0, 0, 4, 0, 0, 4, 0, 84, 255, 252, 255, 255, 253, 255,
+-    73, 0, 0, 154, 255, 251, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 251, 255, 255,
+-    223, 84, 0, 0, 4, 1, 0, 0, 0, 4, 0, 84, 255, 252, 255, 255, 253, 255, 73, 0, 0, 154, 255, 251,
+-    255, 255, 255, 255, 255, 255, 255, 255, 255, 252, 252, 255, 250, 128, 5, 0, 2, 3, 0, 0, 0, 0,
+-    0, 4, 0, 84, 255, 252, 255, 255, 253, 255, 73, 0, 0, 154, 255, 251, 255, 255, 255, 255, 254,
+-    255, 255, 254, 251, 255, 255, 172, 33, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 4, 0, 84, 255, 252, 255,
+-    255, 253, 255, 72, 0, 0, 154, 255, 251, 255, 255, 255, 255, 255, 253, 251, 255, 255, 212, 70,
+-    0, 0, 5, 1, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 86, 255, 251, 254, 254, 252, 255, 74, 0, 0, 155, 255,
+-    251, 254, 255, 254, 255, 183, 255, 255, 236, 110, 0, 0, 3, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3,
+-    0, 75, 255, 255, 255, 255, 255, 255, 63, 0, 0, 146, 255, 253, 255, 255, 255, 254, 15, 133, 129,
+-    24, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 9, 184, 246, 239, 239, 246, 176, 5, 1,
+-    0, 47, 222, 242, 240, 240, 241, 131,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32, 68,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 174, 174, 174, 3, 3, 174, 174, 174, 10, 0, 0,
++    0, 0, 51, 255, 179, 33, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 15, 255, 255, 255, 5, 5, 255, 255,
++    255, 15, 0, 0, 0, 0, 51, 255, 255, 246, 136, 12, 0, 0, 0, 0, 0, 0, 0, 0, 15, 255, 255, 255,
++    5, 5, 255, 255, 255, 15, 0, 0, 0, 0, 51, 255, 255, 255, 255, 228, 94, 0, 0, 0, 0, 0, 0, 0,
++    15, 255, 255, 255, 5, 5, 255, 255, 255, 15, 0, 0, 0, 0, 51, 255, 255, 255, 255, 255, 255, 191, 45, 0,
++    0, 0, 0, 0, 15, 255, 255, 255, 5, 5, 255, 255, 255, 15, 0, 0, 0, 0, 51, 255, 255, 255, 255, 255,
++    255, 255, 251, 153, 19, 0, 0, 0, 15, 255, 255, 255, 5, 5, 255, 255, 255, 15, 0, 0, 0, 0, 51, 255,
++    255, 255, 255, 255, 255, 255, 255, 255, 237, 111, 3, 0, 15, 255, 255, 255, 5, 5, 255, 255, 255, 15, 0, 0,
++    0, 0, 51, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 205, 58, 15, 255, 255, 255, 5, 5, 255, 255,
++    255, 15, 0, 0, 0, 0, 51, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 254, 167, 255, 255, 255,
++    5, 5, 255, 255, 255, 15, 0, 0, 0, 0, 51, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 254,
++    167, 255, 255, 255, 5, 5, 255, 255, 255, 15, 0, 0, 0, 0, 51, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++    255, 255, 205, 58, 15, 255, 255, 255, 5, 5, 255, 255, 255, 15, 0, 0, 0, 0, 51, 255, 255, 255, 255, 255,
++    255, 255, 255, 255, 236, 111, 3, 0, 15, 255, 255, 255, 5, 5, 255, 255, 255, 15, 0, 0, 0, 0, 51, 255,
++    255, 255, 255, 255, 255, 255, 251, 145, 15, 0, 0, 0, 15, 255, 255, 255, 5, 5, 255, 255, 255, 15, 0, 0,
++    0, 0, 51, 255, 255, 255, 255, 255, 255, 190, 45, 0, 0, 0, 0, 0, 15, 255, 255, 255, 5, 5, 255, 255,
++    255, 15, 0, 0, 0, 0, 51, 255, 255, 255, 255, 227, 94, 0, 0, 0, 0, 0, 0, 0, 15, 255, 255, 255,
++    5, 5, 255, 255, 255, 15, 0, 0, 0, 0, 51, 255, 255, 246, 136, 12, 0, 0, 0, 0, 0, 0, 0, 0,
++    15, 255, 255, 255, 5, 5, 255, 255, 255, 15, 0, 0, 0, 0, 51, 255, 179, 33, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 15, 255, 255, 255, 5, 5, 255, 255, 255, 15, 0, 0, 0, 0, 32, 68, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 10, 174, 174, 174, 3, 3, 174, 174, 174, 10, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+ ];
++
+ pub(crate) const PLAY_PAUSE: AlphaMask = AlphaMask {
+-    width: 38,
+-    height: 22,
++    width: 28,
++    height: 28,
+     pixels: PLAY_PAUSE_PIXELS,
+ };
+ 
+ const NEXT_PIXELS: &[u8] = &[
+-    88, 233, 224, 115, 0, 0, 4, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 97, 240, 225, 117, 0, 0, 4, 2,
+-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 234, 255, 255, 255, 207, 67, 0, 0, 5, 1, 0, 0, 0, 0, 0, 0, 1,
+-    0, 9, 233, 255, 255, 255, 206, 66, 0, 0, 5, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 254, 254, 252,
+-    255, 255, 171, 32, 0, 0, 4, 0, 0, 0, 0, 0, 2, 0, 31, 248, 255, 253, 252, 255, 255, 169, 29, 0,
+-    0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255, 252, 253, 255, 249, 126, 4, 0, 3, 3, 0, 0, 0,
+-    2, 0, 30, 247, 255, 254, 255, 252, 253, 255, 247, 122, 2, 0, 3, 2, 0, 0, 0, 0, 0, 0, 255, 255,
+-    255, 255, 255, 255, 251, 255, 255, 221, 81, 0, 0, 5, 1, 0, 2, 0, 30, 248, 255, 254, 255, 255,
+-    255, 251, 255, 255, 217, 76, 0, 0, 5, 1, 0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 254,
+-    250, 255, 255, 183, 42, 0, 0, 4, 2, 0, 31, 248, 255, 254, 255, 255, 255, 255, 254, 250, 255,
+-    255, 178, 37, 0, 0, 4, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 253, 252, 255,
+-    255, 140, 11, 0, 3, 0, 30, 248, 255, 254, 255, 255, 255, 255, 255, 255, 253, 252, 255, 252,
+-    132, 7, 0, 2, 3, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 251, 255, 255, 231,
+-    95, 0, 0, 34, 247, 255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 251, 255, 255, 225, 86, 0,
+-    0, 4, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 254, 250, 255, 255, 198, 44,
+-    18, 249, 255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 254, 250, 255, 255, 188, 41, 0,
+-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 253, 251, 255, 255, 127,
+-    235, 255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 253, 251, 255, 255, 87,
+-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 251, 255, 255,
+-    251, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 251, 255, 246,
+-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 251, 255, 255,
+-    250, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 250, 255, 243,
+-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 253, 252, 255, 250, 116,
+-    236, 255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 252, 252, 255, 245, 74,
+-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 254, 250, 255, 255, 182, 30, 17,
+-    249, 255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 254, 250, 255, 255, 172, 28, 0,
+-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 251, 255, 255, 220, 79, 0, 0, 34, 247,
+-    255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 251, 255, 255, 214, 71, 0, 0, 4, 255, 255,
+-    255, 255, 255, 255, 255, 255, 255, 252, 252, 255, 250, 126, 4, 0, 5, 0, 30, 248, 255, 254, 255,
+-    255, 255, 255, 255, 255, 252, 253, 255, 246, 118, 0, 0, 4, 2, 0, 255, 255, 255, 255, 255, 255,
+-    255, 254, 250, 255, 255, 173, 33, 0, 0, 4, 2, 0, 31, 248, 255, 254, 255, 255, 255, 255, 254,
+-    250, 255, 255, 167, 28, 0, 0, 4, 0, 0, 0, 255, 255, 255, 255, 255, 255, 251, 255, 255, 215, 73,
+-    0, 0, 5, 1, 0, 2, 0, 30, 248, 255, 254, 255, 255, 255, 251, 255, 255, 211, 68, 0, 0, 5, 1, 0,
+-    0, 0, 0, 255, 255, 255, 255, 252, 253, 255, 246, 119, 1, 0, 3, 2, 0, 0, 0, 2, 0, 30, 247, 255,
+-    254, 255, 252, 253, 255, 245, 115, 0, 0, 4, 2, 0, 0, 0, 0, 0, 0, 255, 254, 254, 252, 255, 255,
+-    167, 28, 0, 0, 4, 0, 0, 0, 0, 0, 2, 0, 31, 248, 255, 253, 252, 255, 255, 165, 26, 0, 0, 4, 0,
+-    0, 0, 0, 0, 0, 0, 0, 234, 255, 255, 255, 206, 65, 0, 0, 5, 1, 0, 0, 0, 0, 0, 0, 1, 0, 9, 233,
+-    255, 255, 255, 205, 64, 0, 0, 5, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 88, 232, 228, 118, 0, 0, 4, 2,
+-    0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 97, 240, 225, 117, 0, 0, 4, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-    0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 37, 115, 86, 7, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 104, 119, 104, 3, 0, 0, 24, 243, 255, 255, 221, 83, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 56, 255, 255, 255, 56, 0, 0, 63, 255, 255,
++    255, 255, 255, 192, 49, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 255, 255, 255, 64, 0,
++    0, 64, 255, 255, 255, 255, 255, 255, 253, 162, 24, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 255,
++    255, 255, 64, 0, 0, 64, 255, 255, 255, 255, 255, 255, 255, 255, 244, 128, 8, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 64, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 226, 94, 1, 0,
++    0, 0, 0, 0, 0, 0, 64, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++    255, 255, 199, 56, 0, 0, 0, 0, 0, 0, 64, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 255, 255, 255,
++    255, 255, 255, 255, 255, 255, 255, 253, 162, 24, 0, 0, 0, 0, 64, 255, 255, 255, 64, 0, 0, 64, 255, 255,
++    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 244, 128, 8, 0, 0, 64, 255, 255, 255, 64, 0,
++    0, 64, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 217, 26, 0, 64, 255,
++    255, 255, 64, 0, 0, 64, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++    119, 0, 64, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++    255, 255, 255, 255, 118, 0, 64, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++    255, 255, 255, 255, 255, 255, 255, 216, 25, 0, 64, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 255, 255, 255,
++    255, 255, 255, 255, 255, 255, 255, 255, 255, 244, 128, 8, 0, 0, 64, 255, 255, 255, 64, 0, 0, 64, 255, 255,
++    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 253, 162, 24, 0, 0, 0, 0, 64, 255, 255, 255, 64, 0,
++    0, 64, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 191, 48, 0, 0, 0, 0, 0, 0, 64, 255,
++    255, 255, 64, 0, 0, 64, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 226, 94, 1, 0, 0, 0, 0, 0,
++    0, 0, 64, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 255, 255, 255, 255, 255, 244, 128, 8, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 64, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 255, 255, 255, 253, 162, 24, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 255, 255, 255, 64, 0, 0, 63, 255, 255, 255, 255, 255, 192,
++    49, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 255, 255, 255, 64, 0, 0, 24, 243, 255,
++    255, 221, 83, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 56, 255, 255, 255, 56, 0,
++    0, 0, 37, 119, 86, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 110,
++    136, 110, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+ ];
++
+ pub(crate) const NEXT: AlphaMask = AlphaMask {
+-    width: 38,
+-    height: 22,
++    width: 28,
++    height: 28,
+     pixels: NEXT_PIXELS,
+ };
+ 
+ const MUTE_PIXELS: &[u8] = &[
+-    0, 10, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 4, 0, 88, 228, 231, 61, 0, 3, 0, 0, 0, 0, 0,
+-    148, 237, 76, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 3, 0, 108, 255, 255, 255, 192, 0, 2, 0, 0, 0,
+-    0, 0, 223, 255, 255, 79, 0, 5, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 123, 255, 255, 250, 255, 207, 0,
+-    1, 0, 0, 0, 0, 0, 34, 225, 255, 255, 78, 0, 5, 0, 0, 0, 0, 0, 2, 1, 0, 134, 255, 253, 254, 253,
+-    255, 204, 0, 1, 0, 0, 0, 0, 0, 0, 32, 232, 255, 255, 77, 0, 5, 0, 0, 0, 2, 0, 0, 146, 255, 252,
+-    254, 255, 253, 255, 205, 0, 1, 0, 0, 0, 0, 0, 5, 0, 33, 232, 255, 255, 76, 0, 5, 0, 1, 0, 0,
+-    158, 255, 251, 254, 255, 255, 253, 255, 205, 0, 1, 0, 0, 0, 0, 0, 0, 5, 0, 35, 233, 255, 255,
+-    75, 0, 6, 0, 0, 168, 255, 250, 255, 255, 255, 255, 253, 255, 205, 0, 1, 0, 0, 0, 0, 0, 0, 0, 6,
+-    0, 36, 233, 255, 255, 75, 0, 10, 189, 255, 248, 255, 255, 255, 255, 255, 253, 255, 205, 0, 1,
+-    0, 0, 0, 0, 0, 0, 1, 0, 22, 0, 37, 234, 255, 255, 75, 0, 72, 247, 255, 252, 255, 255, 255, 255,
+-    253, 255, 205, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 209, 112, 0, 41, 234, 255, 254, 75, 0, 62, 251,
+-    255, 252, 255, 255, 255, 253, 255, 205, 0, 1, 0, 0, 0, 0, 0, 2, 0, 32, 254, 255, 99, 0, 41,
+-    235, 255, 254, 76, 0, 62, 252, 255, 252, 255, 255, 253, 255, 205, 0, 1, 0, 0, 0, 0, 0, 2, 0,
+-    41, 253, 255, 255, 99, 0, 42, 236, 255, 253, 75, 0, 63, 252, 255, 252, 255, 252, 255, 205, 0,
+-    1, 0, 0, 0, 0, 0, 2, 0, 40, 255, 254, 255, 255, 98, 0, 43, 236, 255, 253, 74, 0, 64, 253, 255,
+-    252, 253, 255, 205, 0, 1, 0, 0, 0, 0, 0, 2, 0, 40, 255, 255, 253, 255, 255, 97, 0, 44, 237,
+-    255, 253, 73, 0, 65, 253, 255, 249, 255, 205, 0, 1, 0, 0, 0, 0, 0, 2, 0, 40, 255, 255, 255,
+-    253, 255, 255, 96, 0, 45, 237, 255, 252, 72, 0, 66, 254, 255, 255, 205, 0, 1, 0, 0, 0, 0, 0, 2,
+-    0, 40, 255, 255, 254, 255, 253, 255, 255, 95, 0, 46, 238, 255, 252, 71, 0, 67, 252, 255, 202,
+-    0, 1, 0, 0, 0, 0, 0, 2, 0, 40, 255, 255, 255, 255, 255, 253, 255, 255, 94, 0, 46, 238, 255,
+-    251, 70, 0, 66, 255, 211, 0, 1, 0, 0, 0, 0, 0, 2, 0, 39, 253, 255, 255, 255, 255, 255, 253,
+-    255, 255, 93, 0, 47, 239, 255, 251, 70, 0, 81, 201, 0, 0, 0, 0, 0, 0, 0, 1, 0, 16, 241, 255,
+-    250, 252, 252, 252, 252, 250, 255, 255, 92, 0, 48, 240, 255, 251, 67, 0, 39, 6, 0, 0, 0, 0, 0,
+-    0, 0, 3, 0, 141, 255, 255, 255, 255, 255, 255, 255, 253, 255, 255, 91, 0, 49, 240, 255, 250,
+-    65, 0, 4, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 110, 186, 194, 193, 194, 193, 193, 255, 255, 254, 255,
+-    90, 0, 50, 241, 255, 250, 63, 0, 5, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 77, 255,
+-    255, 254, 255, 89, 0, 51, 241, 255, 250, 61, 0, 5, 0, 0, 0, 0, 0, 0, 0, 1, 4, 3, 2, 2, 2, 2, 4,
+-    0, 65, 253, 255, 253, 255, 88, 0, 52, 242, 255, 249, 60, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-    0, 0, 0, 5, 0, 55, 248, 255, 253, 255, 87, 0, 52, 242, 255, 249, 59, 0, 5, 0, 0, 0, 0, 0, 0, 0,
+-    0, 0, 0, 0, 0, 0, 0, 5, 0, 46, 242, 255, 253, 255, 86, 0, 53, 243, 255, 248, 58, 0, 5, 0, 0, 0,
+-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 37, 235, 255, 252, 255, 85, 0, 52, 243, 255, 248, 57, 0,
+-    6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 29, 227, 255, 252, 255, 91, 0, 53, 244, 255,
+-    248, 55, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 23, 210, 255, 255, 141, 0, 0,
+-    51, 245, 255, 241, 60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 3, 89, 85, 0, 0,
+-    6, 0, 51, 240, 255, 231, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 1,
+-    0, 6, 0, 56, 230, 128,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 18, 13, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 60, 240, 64, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 41, 237, 255,
++    64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    25, 224, 255, 255, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 13, 206, 255, 255, 255, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 5, 185, 255, 255, 255, 255, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 160, 255, 255, 255, 255, 255, 64, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 60, 68, 145, 255, 255, 255, 255, 255, 255, 64, 0, 0, 0,
++    9, 52, 8, 0, 0, 0, 0, 9, 52, 8, 0, 0, 4, 145, 253, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++    64, 0, 0, 9, 212, 255, 216, 29, 0, 0, 29, 216, 255, 211, 9, 0, 123, 255, 255, 255, 255, 255, 255, 255,
++    255, 255, 255, 255, 64, 0, 0, 52, 255, 255, 255, 220, 29, 29, 220, 255, 255, 255, 51, 0, 219, 255, 255, 255,
++    255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 9, 216, 255, 255, 255, 220, 220, 255, 255, 255, 215, 8, 0,
++    253, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 0, 28, 219, 255, 255, 255, 255, 255, 255,
++    223, 32, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 0, 0, 28, 219, 255,
++    255, 255, 255, 223, 32, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 0,
++    0, 28, 219, 255, 255, 255, 255, 224, 32, 0, 0, 0, 253, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++    64, 0, 0, 0, 29, 219, 255, 255, 255, 255, 255, 255, 224, 32, 0, 0, 216, 255, 255, 255, 255, 255, 255, 255,
++    255, 255, 255, 255, 64, 0, 0, 9, 216, 255, 255, 255, 220, 220, 255, 255, 255, 216, 9, 0, 114, 255, 255, 255,
++    255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 52, 255, 255, 255, 220, 29, 29, 220, 255, 255, 255, 51, 0,
++    2, 135, 252, 255, 255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 9, 211, 255, 216, 29, 0, 0, 29, 216,
++    255, 211, 8, 0, 0, 0, 13, 59, 68, 145, 255, 255, 255, 255, 255, 255, 64, 0, 0, 0, 8, 51, 8, 0,
++    0, 0, 0, 8, 51, 8, 0, 0, 0, 0, 0, 0, 0, 1, 160, 255, 255, 255, 255, 255, 64, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 184, 255, 255, 255, 255,
++    64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 13,
++    206, 255, 255, 255, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 25, 223, 255, 255, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 41, 237, 255, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 60, 240, 64, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 20, 14, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+ ];
++
+ pub(crate) const MUTE: AlphaMask = AlphaMask {
+-    width: 29,
+-    height: 30,
++    width: 28,
++    height: 28,
+     pixels: MUTE_PIXELS,
+ };
+ 
+ const VOLUME_DOWN_PIXELS: &[u8] = &[
+-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 18, 181, 249, 136, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 25, 218, 255, 255, 255, 53, 0, 3, 0, 0, 0, 0, 0,
+-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 33, 231, 255, 250, 251, 255, 80, 0, 3, 0, 0, 0,
+-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 41, 238, 255, 250, 255, 252, 255, 76, 0, 3,
+-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 50, 244, 255, 251, 255, 255, 252, 255,
+-    77, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 2, 2, 2, 2, 6, 0, 59, 250, 255, 251, 255, 255,
+-    255, 252, 255, 77, 0, 3, 0, 0, 0, 0, 4, 4, 0, 0, 1, 3, 0, 0, 0, 0, 0, 0, 0, 70, 255, 255, 252,
+-    255, 255, 255, 255, 252, 255, 77, 0, 3, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 21, 33, 32, 33, 35, 25,
+-    90, 255, 255, 252, 255, 255, 255, 255, 255, 252, 255, 77, 0, 3, 0, 0, 0, 0, 105, 104, 0, 2, 12,
+-    166, 245, 250, 250, 251, 251, 249, 255, 255, 253, 255, 255, 255, 255, 255, 255, 252, 255, 77,
+-    0, 3, 0, 3, 0, 69, 255, 255, 81, 0, 165, 255, 255, 255, 255, 255, 255, 255, 253, 254, 255, 255,
+-    255, 255, 255, 255, 255, 252, 255, 77, 0, 3, 0, 1, 0, 24, 228, 255, 215, 3, 243, 255, 253, 254,
+-    254, 254, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 252, 255, 77, 0, 3, 0, 0, 4,
+-    0, 100, 255, 255, 89, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+-    255, 255, 255, 252, 255, 77, 0, 3, 0, 0, 1, 0, 11, 229, 255, 171, 255, 255, 255, 255, 255, 255,
+-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 252, 255, 77, 0, 3, 0, 0, 0, 3, 0, 172,
+-    255, 219, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+-    252, 255, 77, 0, 3, 0, 0, 0, 4, 0, 135, 255, 242, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+-    255, 255, 255, 255, 255, 255, 255, 255, 252, 255, 77, 0, 3, 0, 0, 0, 4, 0, 122, 255, 249, 255,
+-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 252, 255, 77,
+-    0, 3, 0, 0, 0, 4, 0, 133, 255, 244, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+-    255, 255, 255, 255, 255, 252, 255, 77, 0, 3, 0, 0, 0, 3, 0, 171, 255, 224, 255, 255, 255, 255,
+-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 252, 255, 77, 0, 3, 0, 0, 1,
+-    0, 10, 228, 255, 180, 245, 255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+-    255, 255, 255, 252, 255, 77, 0, 3, 0, 0, 4, 0, 99, 255, 255, 103, 175, 255, 254, 255, 255, 255,
+-    255, 255, 253, 254, 255, 255, 255, 255, 255, 255, 255, 252, 255, 77, 0, 3, 0, 1, 0, 19, 225,
+-    255, 228, 13, 20, 183, 255, 255, 255, 255, 255, 255, 255, 255, 253, 255, 255, 255, 255, 255,
+-    255, 252, 255, 77, 0, 3, 0, 3, 0, 79, 255, 255, 103, 0, 0, 0, 34, 48, 48, 48, 50, 40, 95, 255,
+-    255, 252, 255, 255, 255, 255, 255, 252, 255, 77, 0, 3, 0, 1, 0, 4, 143, 137, 0, 0, 2, 1, 0, 0,
+-    0, 0, 0, 0, 0, 75, 255, 255, 252, 255, 255, 255, 255, 252, 255, 77, 0, 3, 0, 0, 1, 0, 0, 0, 0,
+-    0, 0, 0, 2, 2, 2, 2, 2, 2, 6, 0, 69, 255, 255, 252, 255, 255, 255, 252, 255, 77, 0, 3, 0, 0, 0,
+-    1, 4, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 64, 254, 255, 252, 255, 255, 252, 255, 77, 0,
+-    3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 58, 251, 255, 251, 255, 252,
+-    255, 77, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 54, 249, 255,
+-    250, 252, 255, 79, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 47,
+-    239, 255, 255, 255, 62, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5,
+-    0, 39, 196, 248, 157, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 18, 13, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 60, 240, 64, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 41, 237, 255,
++    64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    25, 224, 255, 255, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 13, 206, 255, 255, 255, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 5, 185, 255, 255, 255, 255, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 163, 255, 255, 255, 255, 255, 64, 0, 0, 2, 163, 249, 158, 2,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 60, 68, 145, 255, 255, 255, 255, 255, 255, 64, 0, 0, 50,
++    255, 255, 255, 103, 0, 0, 0, 0, 0, 0, 0, 0, 4, 145, 253, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++    64, 0, 0, 20, 244, 255, 255, 235, 9, 0, 0, 0, 0, 0, 0, 0, 123, 255, 255, 255, 255, 255, 255, 255,
++    255, 255, 255, 255, 64, 0, 0, 0, 117, 255, 255, 255, 95, 0, 0, 0, 0, 0, 0, 0, 218, 255, 255, 255,
++    255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 0, 10, 239, 255, 255, 169, 0, 0, 0, 0, 0, 0, 0,
++    253, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 0, 0, 173, 255, 255, 222, 0, 0, 0,
++    0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 0, 0, 136, 255, 255,
++    245, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 0,
++    0, 137, 255, 255, 244, 0, 0, 0, 0, 0, 0, 0, 253, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++    64, 0, 0, 0, 0, 173, 255, 255, 221, 0, 0, 0, 0, 0, 0, 0, 216, 255, 255, 255, 255, 255, 255, 255,
++    255, 255, 255, 255, 64, 0, 0, 0, 11, 240, 255, 255, 168, 0, 0, 0, 0, 0, 0, 0, 114, 255, 255, 255,
++    255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 0, 118, 255, 255, 255, 95, 0, 0, 0, 0, 0, 0, 0,
++    2, 135, 252, 255, 255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 20, 244, 255, 255, 235, 8, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 13, 59, 68, 145, 255, 255, 255, 255, 255, 255, 64, 0, 0, 49, 255, 255, 255, 103,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 163, 255, 255, 255, 255, 255, 64, 0, 0, 2,
++    160, 249, 158, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 184, 255, 255, 255, 255,
++    64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 13,
++    206, 255, 255, 255, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 25, 223, 255, 255, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 41, 237, 255, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 60, 240, 64, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 20, 14, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+ ];
++
+ pub(crate) const VOLUME_DOWN: AlphaMask = AlphaMask {
+-    width: 30,
+-    height: 29,
++    width: 28,
++    height: 28,
+     pixels: VOLUME_DOWN_PIXELS,
+ };
+ 
+ const VOLUME_UP_PIXELS: &[u8] = &[
+-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 8, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0,
+-    104, 255, 65, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 17, 179, 235, 86, 0, 3, 0, 0, 0, 0,
+-    0, 0, 0, 0, 2, 3, 0, 4, 0, 133, 255, 212, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 23, 221,
+-    255, 255, 208, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 0, 9, 220, 255, 121, 0, 5, 0, 0, 0, 0,
+-    0, 0, 0, 0, 5, 0, 28, 227, 255, 247, 255, 205, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 36, 83, 0, 1, 4,
+-    0, 92, 255, 232, 14, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 34, 232, 255, 250, 253, 255, 205, 0, 1, 0,
+-    0, 0, 0, 0, 0, 3, 0, 179, 255, 89, 0, 4, 0, 0, 210, 255, 102, 0, 0, 3, 4, 4, 4, 4, 7, 0, 40,
+-    238, 255, 251, 255, 253, 255, 205, 0, 1, 0, 0, 0, 2, 1, 1, 3, 0, 101, 255, 231, 14, 0, 6, 0,
+-    109, 255, 191, 0, 2, 0, 0, 0, 0, 0, 0, 48, 242, 255, 251, 255, 255, 253, 255, 205, 0, 1, 0, 0,
+-    0, 0, 0, 0, 2, 0, 0, 198, 255, 118, 0, 6, 0, 29, 250, 250, 38, 0, 57, 111, 111, 111, 110, 117,
+-    240, 255, 251, 255, 255, 255, 253, 255, 205, 0, 1, 1, 0, 0, 151, 190, 5, 0, 5, 0, 83, 255, 213,
+-    1, 0, 3, 0, 189, 255, 99, 117, 255, 255, 255, 255, 255, 255, 255, 253, 255, 255, 255, 255, 253,
+-    255, 205, 0, 1, 1, 0, 4, 228, 255, 126, 0, 5, 0, 10, 229, 255, 52, 0, 7, 0, 128, 255, 155, 241,
+-    255, 250, 251, 251, 251, 251, 254, 255, 255, 255, 255, 255, 253, 255, 205, 0, 1, 0, 4, 0, 89,
+-    255, 230, 12, 0, 4, 0, 165, 255, 107, 0, 8, 0, 80, 255, 199, 254, 254, 255, 255, 255, 255, 255,
+-    255, 255, 255, 255, 255, 255, 253, 255, 205, 0, 1, 0, 1, 0, 0, 216, 255, 70, 0, 7, 0, 112, 255,
+-    151, 0, 6, 0, 48, 255, 229, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+-    253, 255, 205, 0, 1, 0, 0, 4, 0, 150, 255, 114, 0, 8, 0, 80, 255, 179, 0, 4, 0, 30, 250, 248,
+-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 253, 255, 205, 0, 1, 0, 0, 4,
+-    0, 117, 255, 137, 0, 7, 0, 64, 255, 193, 0, 3, 0, 22, 243, 255, 255, 255, 255, 255, 255, 255,
+-    255, 255, 255, 255, 255, 255, 255, 253, 255, 205, 0, 1, 0, 0, 4, 0, 115, 255, 138, 0, 7, 0, 63,
+-    255, 193, 0, 3, 0, 21, 243, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+-    255, 253, 255, 205, 0, 1, 0, 0, 4, 0, 143, 255, 118, 0, 8, 0, 77, 255, 180, 0, 4, 0, 28, 248,
+-    250, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 253, 255, 205, 0, 1, 0,
+-    0, 1, 0, 205, 255, 75, 0, 7, 0, 108, 255, 153, 0, 6, 0, 43, 255, 233, 242, 255, 249, 251, 251,
+-    251, 251, 254, 255, 255, 255, 255, 255, 253, 255, 205, 0, 1, 0, 3, 0, 69, 255, 236, 17, 0, 5,
+-    0, 160, 255, 109, 0, 7, 0, 70, 255, 204, 127, 255, 255, 255, 255, 255, 255, 255, 253, 255, 255,
+-    255, 255, 253, 255, 205, 0, 1, 1, 0, 0, 212, 255, 137, 0, 5, 0, 8, 225, 255, 53, 0, 7, 0, 113,
+-    255, 161, 0, 72, 130, 130, 130, 129, 131, 240, 255, 251, 255, 255, 255, 253, 255, 205, 0, 1, 1,
+-    0, 0, 166, 207, 10, 0, 5, 0, 80, 255, 214, 1, 0, 4, 0, 171, 255, 104, 1, 0, 0, 0, 0, 0, 0, 50,
+-    244, 255, 251, 255, 255, 253, 255, 205, 0, 1, 0, 1, 0, 0, 0, 0, 2, 0, 0, 198, 255, 121, 0, 5,
+-    0, 13, 235, 255, 43, 0, 3, 4, 4, 4, 4, 7, 0, 44, 242, 255, 251, 255, 253, 255, 205, 0, 1, 0, 0,
+-    1, 1, 0, 1, 3, 0, 106, 255, 234, 17, 0, 5, 0, 82, 255, 198, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 40,
+-    239, 255, 251, 253, 255, 205, 0, 1, 0, 0, 0, 0, 1, 0, 3, 0, 194, 255, 99, 0, 4, 3, 0, 184, 255,
+-    110, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 36, 235, 255, 247, 255, 205, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+-    0, 47, 101, 0, 0, 4, 0, 63, 255, 240, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 33, 232, 255,
+-    255, 208, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 198, 255, 130, 0, 5, 0, 0, 0, 0, 0,
+-    0, 0, 0, 0, 0, 5, 0, 27, 179, 220, 80, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 2, 4, 0, 4, 0, 119, 255,
+-    221, 10, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-    0, 0, 3, 0, 116, 255, 75, 0, 4, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 18, 13, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 60, 240, 64, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 41, 237, 255,
++    64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 48, 130, 56, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    26, 224, 255, 255, 64, 0, 0, 0, 0, 0, 0, 0, 0, 15, 241, 255, 249, 47, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 14, 207, 255, 255, 255, 64, 0, 0, 0, 0, 0, 0, 0, 0, 30, 255, 255, 255, 189, 0, 0,
++    0, 0, 0, 0, 0, 0, 6, 187, 255, 255, 255, 255, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 180, 255,
++    255, 255, 73, 0, 0, 0, 0, 0, 0, 1, 163, 255, 255, 255, 255, 255, 64, 0, 0, 2, 160, 248, 158, 2,
++    0, 0, 40, 250, 255, 255, 178, 0, 0, 0, 16, 60, 68, 145, 255, 255, 255, 255, 255, 255, 64, 0, 0, 48,
++    255, 255, 255, 103, 0, 0, 0, 168, 255, 255, 251, 25, 4, 145, 253, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++    64, 0, 0, 21, 244, 255, 255, 235, 9, 0, 0, 70, 255, 255, 255, 96, 123, 255, 255, 255, 255, 255, 255, 255,
++    255, 255, 255, 255, 64, 0, 0, 0, 116, 255, 255, 255, 95, 0, 0, 5, 245, 255, 255, 153, 218, 255, 255, 255,
++    255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 0, 10, 239, 255, 255, 169, 0, 0, 0, 192, 255, 255, 205,
++    253, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 0, 0, 173, 255, 255, 222, 0, 0, 0,
++    156, 255, 255, 227, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 0, 0, 136, 255, 255,
++    245, 0, 0, 0, 137, 255, 255, 246, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 0,
++    0, 137, 255, 255, 244, 0, 0, 0, 138, 255, 255, 245, 253, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++    64, 0, 0, 0, 0, 173, 255, 255, 221, 0, 0, 0, 156, 255, 255, 227, 216, 255, 255, 255, 255, 255, 255, 255,
++    255, 255, 255, 255, 64, 0, 0, 0, 11, 240, 255, 255, 168, 0, 0, 0, 193, 255, 255, 204, 114, 255, 255, 255,
++    255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 0, 118, 255, 255, 255, 95, 0, 0, 5, 245, 255, 255, 153,
++    2, 135, 252, 255, 255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 21, 244, 255, 255, 234, 8, 0, 0, 71,
++    255, 255, 255, 96, 0, 0, 13, 59, 68, 145, 255, 255, 255, 255, 255, 255, 64, 0, 0, 48, 255, 255, 255, 102,
++    0, 0, 0, 169, 255, 255, 251, 25, 0, 0, 0, 0, 0, 1, 163, 255, 255, 255, 255, 255, 64, 0, 0, 2,
++    158, 249, 157, 1, 0, 0, 41, 251, 255, 255, 177, 0, 0, 0, 0, 0, 0, 0, 6, 187, 255, 255, 255, 255,
++    64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 180, 255, 255, 255, 73, 0, 0, 0, 0, 0, 0, 0, 0, 14,
++    207, 255, 255, 255, 64, 0, 0, 0, 0, 0, 0, 0, 0, 30, 255, 255, 255, 189, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 26, 224, 255, 255, 64, 0, 0, 0, 0, 0, 0, 0, 0, 14, 240, 255, 250, 47, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 41, 237, 255, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 46, 133,
++    59, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 60, 240, 64, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 20, 14, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+ ];
++
+ pub(crate) const VOLUME_UP: AlphaMask = AlphaMask {
+-    width: 37,
+-    height: 26,
++    width: 28,
++    height: 28,
+     pixels: VOLUME_UP_PIXELS,
+ };
++
++const PLAY_PIXELS: &[u8] = &[
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 2, 53, 41, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 11, 202, 255, 255, 192, 49, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 95, 255, 255, 255, 255, 253, 156, 24, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 126, 255, 255, 255, 255,
++    255, 255, 242, 119, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128,
++    255, 255, 255, 255, 255, 255, 255, 255, 226, 94, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 200, 56, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 253, 162, 24, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++    255, 244, 128, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 255,
++    255, 255, 255, 255, 255, 255, 255, 226, 94, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255,
++    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 200, 56, 0, 0, 0, 0, 0, 0, 0, 0, 128,
++    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 253, 156, 22, 0, 0, 0,
++    0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++    227, 19, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++    255, 255, 255, 255, 255, 100, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++    255, 255, 255, 255, 255, 255, 255, 255, 255, 98, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 255,
++    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 225, 18, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255,
++    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 253, 155, 22, 0, 0, 0, 0, 0, 0, 128,
++    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 191, 48, 0, 0, 0, 0, 0,
++    0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 225, 94, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 244, 128, 8,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 253,
++    162, 24, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 255,
++    255, 255, 191, 48, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255,
++    255, 255, 255, 255, 225, 94, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 126,
++    255, 255, 255, 255, 255, 255, 241, 118, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 95, 255, 255, 255, 255, 252, 154, 23, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 10, 200, 255, 255, 190, 47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 49, 38, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++];
++
++pub(crate) const PLAY: AlphaMask = AlphaMask {
++    width: 28,
++    height: 28,
++    pixels: PLAY_PIXELS,
++};
++
++const PAUSE_PIXELS: &[u8] = &[
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 20, 65, 68, 68, 68, 68, 60, 9, 0, 0, 0, 0, 9, 60, 68, 68,
++    68, 68, 65, 20, 0, 0, 0, 0, 0, 0, 0, 43, 241, 255, 255, 255, 255, 255, 255, 211, 8, 0, 0, 9,
++    212, 255, 255, 255, 255, 255, 255, 241, 42, 0, 0, 0, 0, 0, 0, 121, 255, 255, 255, 255, 255, 255, 255, 255,
++    57, 0, 0, 58, 255, 255, 255, 255, 255, 255, 255, 255, 121, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255,
++    255, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 255, 255, 255, 255, 255, 128, 0, 0, 0, 0, 0, 0, 128,
++    255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 255, 255, 255, 255, 255, 128, 0, 0, 0,
++    0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 255, 255, 255, 255, 255,
++    128, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 255,
++    255, 255, 255, 255, 128, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 64,
++    255, 255, 255, 255, 255, 255, 255, 255, 128, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 255,
++    64, 0, 0, 64, 255, 255, 255, 255, 255, 255, 255, 255, 128, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255,
++    255, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 255, 255, 255, 255, 255, 128, 0, 0, 0, 0, 0, 0, 128,
++    255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 255, 255, 255, 255, 255, 128, 0, 0, 0,
++    0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 255, 255, 255, 255, 255,
++    128, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 255,
++    255, 255, 255, 255, 128, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 64,
++    255, 255, 255, 255, 255, 255, 255, 255, 128, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 255,
++    64, 0, 0, 64, 255, 255, 255, 255, 255, 255, 255, 255, 128, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255,
++    255, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 255, 255, 255, 255, 255, 128, 0, 0, 0, 0, 0, 0, 128,
++    255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 255, 255, 255, 255, 255, 128, 0, 0, 0,
++    0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 255, 255, 255, 255, 255,
++    128, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 255,
++    255, 255, 255, 255, 128, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 64,
++    255, 255, 255, 255, 255, 255, 255, 255, 128, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 255,
++    64, 0, 0, 64, 255, 255, 255, 255, 255, 255, 255, 255, 128, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255,
++    255, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 255, 255, 255, 255, 255, 128, 0, 0, 0, 0, 0, 0, 128,
++    255, 255, 255, 255, 255, 255, 255, 255, 64, 0, 0, 64, 255, 255, 255, 255, 255, 255, 255, 255, 128, 0, 0, 0,
++    0, 0, 0, 121, 255, 255, 255, 255, 255, 255, 255, 255, 57, 0, 0, 58, 255, 255, 255, 255, 255, 255, 255, 255,
++    121, 0, 0, 0, 0, 0, 0, 43, 241, 255, 255, 255, 255, 255, 255, 210, 8, 0, 0, 9, 211, 255, 255, 255,
++    255, 255, 255, 241, 41, 0, 0, 0, 0, 0, 0, 0, 20, 65, 68, 68, 68, 68, 59, 8, 0, 0, 0, 0,
++    8, 59, 68, 68, 68, 68, 65, 19, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++];
++
++pub(crate) const PAUSE: AlphaMask = AlphaMask {
++    width: 28,
++    height: 28,
++    pixels: PAUSE_PIXELS,
++};
+diff --git a/crates/t1-touchbar/src/stock_slice.rs b/crates/t1-touchbar/src/stock_slice.rs
+index 4c0ae87..ade0b30 100644
+--- a/crates/t1-touchbar/src/stock_slice.rs
++++ b/crates/t1-touchbar/src/stock_slice.rs
+@@ -13,27 +13,109 @@ const ACTIVE_RIGHT: u32 = NATIVE_WIDTH;
+ const FUNCTION_SLOT_COUNT: u32 = 13;
+ const PLATE_Y: u32 = 0;
+ const PLATE_HEIGHT: u32 = 60;
+-const PLATE_RADIUS: u32 = 8;
++const CAPSULE_RADIUS: u32 = 30;
++const PRESSED_INSET: u32 = 4;
++const SEPARATOR_INSET_Y: u32 = 16;
++const SEPARATOR_WIDTH: u32 = 2;
+ 
+ const BACKGROUND: Rgb = Rgb {
+     red: 0,
+     green: 0,
+     blue: 0,
+ };
+-const PLATE: Rgb = Rgb {
+-    red: 53,
+-    green: 53,
+-    blue: 53,
++const PLATE_TOP: Rgb = Rgb {
++    red: 60,
++    green: 60,
++    blue: 64,
+ };
+-const PRESSED_PLATE: Rgb = Rgb {
+-    red: 76,
+-    green: 76,
+-    blue: 76,
++const PLATE_BOTTOM: Rgb = Rgb {
++    red: 42,
++    green: 42,
++    blue: 46,
++};
++const PRESSED_TOP: Rgb = Rgb {
++    red: 98,
++    green: 98,
++    blue: 104,
++};
++const PRESSED_BOTTOM: Rgb = Rgb {
++    red: 78,
++    green: 78,
++    blue: 84,
++};
++const SEPARATOR: Rgb = Rgb {
++    red: 72,
++    green: 72,
++    blue: 78,
+ };
+ const LABEL: Rgb = Rgb {
+-    red: 242,
+-    green: 242,
+-    blue: 242,
++    red: 235,
++    green: 235,
++    blue: 240,
++};
++const BACKLIGHT_OFF_LABEL: Rgb = Rgb {
++    red: 255,
++    green: 159,
++    blue: 10,
++};
++const PLAYING_TOP: Rgb = Rgb {
++    red: 40,
++    green: 128,
++    blue: 66,
++};
++const PLAYING_BOTTOM: Rgb = Rgb {
++    red: 28,
++    green: 100,
++    blue: 50,
++};
++const PLAYING_PRESSED_TOP: Rgb = Rgb {
++    red: 62,
++    green: 160,
++    blue: 88,
++};
++const PLAYING_PRESSED_BOTTOM: Rgb = Rgb {
++    red: 46,
++    green: 130,
++    blue: 70,
++};
++const EXTERNAL_OUTPUT_LABEL: Rgb = Rgb {
++    red: 10,
++    green: 132,
++    blue: 255,
++};
++const NIGHT_LIGHT_LABEL: Rgb = Rgb {
++    red: 255,
++    green: 140,
++    blue: 60,
++};
++const LOUD_GAUGE_FILL: Rgb = Rgb {
++    red: 255,
++    green: 159,
++    blue: 10,
++};
++/// Volume above which the gauge turns orange as a hearing reminder.
++const LOUD_VOLUME_PERCENT: u8 = 80;
++const PROGRESS_FILL: Rgb = Rgb {
++    red: 48,
++    green: 209,
++    blue: 88,
++};
++const GAUGE_TRACK: Rgb = Rgb {
++    red: 70,
++    green: 70,
++    blue: 76,
++};
++const GAUGE_FILL: Rgb = Rgb {
++    red: 190,
++    green: 190,
++    blue: 198,
++};
++const GAUGE_Y: u32 = 51;
++const GAUGE_HEIGHT: u32 = 3;
++const MUTED_LABEL: Rgb = Rgb {
++    red: 255,
++    green: 69,
++    blue: 58,
+ };
+ 
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+@@ -90,6 +172,12 @@ pub struct StockLevels {
+     pub keyboard_backlight: Option<u8>,
+     pub volume: Option<u8>,
+     pub muted: bool,
++    pub playing: Option<bool>,
++    pub external_output: bool,
++    pub night_light: bool,
++    /// Track progress in thousandths, interpolated by the renderer.
++    pub progress: Option<u16>,
++    pub auto_brightness: Option<bool>,
+ }
+ 
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+@@ -211,6 +299,9 @@ const NORMAL_CONTROLS: [NativeControl; 10] = [
+     },
+ ];
+ 
++/// Index ranges of `NORMAL_CONTROLS` drawn together as one capsule.
++const CONTROL_GROUPS: [(usize, usize); 4] = [(0, 2), (2, 4), (4, 7), (7, 10)];
++
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ struct LaidOutControl {
+     control: Control,
+@@ -328,23 +419,153 @@ impl StockBar {
+     fn render_normal_row(
+         self,
+         frame: &mut Xrgb8888Frame<'_>,
+-        _levels: StockLevels,
++        levels: StockLevels,
+         pressed: Option<StockAction>,
+     ) -> Result<(), StockSliceError> {
+-        self.draw_plate(frame, self.escape_bounds(), StockAction::Escape, pressed)?;
++        self.draw_plate(
++            frame,
++            self.escape_bounds(),
++            CAPSULE_RADIUS,
++            StockAction::Escape,
++            pressed,
++        )?;
+         stock_art::draw_label(frame, self.escape_bounds(), stock_labels::ESC, LABEL)?;
+-        for item in self.normal_controls() {
+-            if !self.control_visible(item.control) {
++        let controls = self.normal_controls();
++        for (first, end) in CONTROL_GROUPS {
++            let members: Vec<LaidOutControl> = controls[first..end]
++                .iter()
++                .copied()
++                .filter(|item| self.control_visible(item.control))
++                .collect();
++            let (Some(head), Some(tail)) = (members.first(), members.last()) else {
+                 continue;
++            };
++            let capsule = Rectangle {
++                width: tail.bounds.x + tail.bounds.width - head.bounds.x,
++                ..head.bounds
++            };
++            stock_art::draw_gradient_plate(
++                frame,
++                capsule,
++                self.scaled_y(CAPSULE_RADIUS).max(1),
++                PLATE_TOP,
++                PLATE_BOTTOM,
++            )?;
++            for (index, item) in members.iter().enumerate() {
++                if index > 0 {
++                    self.draw_separator(frame, item.bounds)?;
++                }
++                let action = control_action(item.control);
++                let playing =
++                    item.control == Control::MediaPlayPause && matches!(levels.playing, Some(true));
++                let highlight = match (pressed == Some(action), playing) {
++                    (true, false) => Some((PRESSED_TOP, PRESSED_BOTTOM)),
++                    (true, true) => Some((PLAYING_PRESSED_TOP, PLAYING_PRESSED_BOTTOM)),
++                    (false, true) => Some((PLAYING_TOP, PLAYING_BOTTOM)),
++                    (false, false) => None,
++                };
++                if let Some((top, bottom)) = highlight {
++                    let inset = self.scaled_y(PRESSED_INSET);
++                    stock_art::draw_gradient_plate(
++                        frame,
++                        Rectangle {
++                            x: item.bounds.x + inset,
++                            y: item.bounds.y + inset,
++                            width: item.bounds.width.saturating_sub(2 * inset).max(1),
++                            height: item.bounds.height.saturating_sub(2 * inset).max(1),
++                        },
++                        self.scaled_y(CAPSULE_RADIUS - PRESSED_INSET).max(1),
++                        top,
++                        bottom,
++                    )?;
++                }
++                stock_art::draw_symbol(
++                    frame,
++                    item.bounds,
++                    symbol_for(item.control, levels),
++                    label_color(item.control, levels),
++                )?;
++            }
++            if let Some((permille, fill)) = group_gauge(head.control, levels) {
++                let track = self.draw_gauge(frame, capsule, permille, fill)?;
++                if head.control == Control::DisplayDown && levels.auto_brightness == Some(false) {
++                    self.draw_manual_dot(frame, track)?;
++                }
+             }
+-            let action = control_action(item.control);
+-            self.draw_plate(frame, item.bounds, action, pressed)?;
+-            let symbol = control_symbol(item.control);
+-            stock_art::draw_symbol(frame, item.bounds, symbol, LABEL)?;
+         }
+         Ok(())
+     }
+ 
++    /// Level bar along the flat bottom edge of a capsule.
++    fn draw_gauge(
++        self,
++        frame: &mut Xrgb8888Frame<'_>,
++        capsule: Rectangle,
++        permille: u16,
++        fill: Rgb,
++    ) -> Result<Rectangle, StockSliceError> {
++        let margin = self.scaled_y(CAPSULE_RADIUS);
++        let track = Rectangle {
++            x: capsule.x + margin,
++            y: capsule.y + self.scaled_y(GAUGE_Y),
++            width: capsule.width.saturating_sub(2 * margin).max(1),
++            height: self.scaled_y(GAUGE_HEIGHT).max(1),
++        };
++        let radius = track.height / 2;
++        stock_art::draw_gradient_plate(frame, track, radius, GAUGE_TRACK, GAUGE_TRACK)?;
++        let filled = track.width * u32::from(permille.min(1_000)) / 1_000;
++        if filled > 0 {
++            stock_art::draw_gradient_plate(
++                frame,
++                Rectangle {
++                    width: filled.max(track.height),
++                    ..track
++                },
++                radius,
++                fill,
++                fill,
++            )?;
++        }
++        Ok(track)
++    }
++
++    /// Small dot after a gauge: automatic brightness is off (manual level).
++    fn draw_manual_dot(
++        self,
++        frame: &mut Xrgb8888Frame<'_>,
++        track: Rectangle,
++    ) -> Result<(), StockSliceError> {
++        let size = self.scaled_y(6).max(2);
++        let dot = Rectangle {
++            x: track.x + track.width + self.scaled_x(8),
++            y: (track.y + track.height / 2).saturating_sub(size / 2),
++            width: size,
++            height: size,
++        };
++        stock_art::draw_gradient_plate(frame, dot, size / 2, GAUGE_FILL, GAUGE_FILL)?;
++        Ok(())
++    }
++
++    /// Thin divider centred in the gap left of `bounds`, inside its capsule.
++    fn draw_separator(
++        self,
++        frame: &mut Xrgb8888Frame<'_>,
++        bounds: Rectangle,
++    ) -> Result<(), StockSliceError> {
++        let gap_offset = self.scaled_x(4) + SEPARATOR_WIDTH / 2;
++        let inset = self.scaled_y(SEPARATOR_INSET_Y);
++        frame.fill_rectangle(
++            Rectangle {
++                x: bounds.x.saturating_sub(gap_offset),
++                y: bounds.y + inset,
++                width: SEPARATOR_WIDTH,
++                height: bounds.height.saturating_sub(2 * inset).max(1),
++            },
++            SEPARATOR,
++        )?;
++        Ok(())
++    }
++
+     fn render_function_row(
+         self,
+         frame: &mut Xrgb8888Frame<'_>,
+@@ -356,7 +577,7 @@ impl StockBar {
+                 continue;
+             }
+             let action = function_action(slot).ok_or(StockSliceError::InvalidGeometry)?;
+-            self.draw_plate(frame, bounds, action, pressed)?;
++            self.draw_plate(frame, bounds, CAPSULE_RADIUS, action, pressed)?;
+             stock_art::draw_label(frame, bounds, function_label(action)?, LABEL)?;
+         }
+         Ok(())
+@@ -366,19 +587,16 @@ impl StockBar {
+         self,
+         frame: &mut Xrgb8888Frame<'_>,
+         bounds: Rectangle,
++        radius: u32,
+         action: StockAction,
+         pressed: Option<StockAction>,
+     ) -> Result<(), StockSliceError> {
+-        stock_art::draw_rounded_plate(
+-            frame,
+-            bounds,
+-            self.scaled_y(PLATE_RADIUS).max(1),
+-            if pressed == Some(action) {
+-                PRESSED_PLATE
+-            } else {
+-                PLATE
+-            },
+-        )?;
++        let (top, bottom) = if pressed == Some(action) {
++            (PRESSED_TOP, PRESSED_BOTTOM)
++        } else {
++            (PLATE_TOP, PLATE_BOTTOM)
++        };
++        stock_art::draw_gradient_plate(frame, bounds, self.scaled_y(radius).max(1), top, bottom)?;
+         Ok(())
+     }
+ 
+@@ -506,6 +724,55 @@ const fn control_action(control: Control) -> StockAction {
+     }
+ }
+ 
++/// Play/pause shows the action a tap will perform once MPRIS state is known.
++const fn symbol_for(control: Control, levels: StockLevels) -> Symbol {
++    match (control, levels.playing) {
++        (Control::MediaPlayPause, Some(true)) => Symbol::Pause,
++        (Control::MediaPlayPause, Some(false)) => Symbol::Play,
++        _ => control_symbol(control),
++    }
++}
++
++const fn label_color(control: Control, levels: StockLevels) -> Rgb {
++    match control {
++        Control::Mute if levels.muted => MUTED_LABEL,
++        Control::Mute | Control::VolumeDown | Control::VolumeUp if levels.external_output => {
++            EXTERNAL_OUTPUT_LABEL
++        }
++        Control::DisplayDown | Control::DisplayUp if levels.night_light => NIGHT_LIGHT_LABEL,
++        Control::KeyboardDown | Control::KeyboardUp
++            if matches!(levels.keyboard_backlight, Some(0)) =>
++        {
++            BACKLIGHT_OFF_LABEL
++        }
++        _ => LABEL,
++    }
++}
++
++/// Gauge level and fill for the capsule that starts with `head`, if any.
++const fn group_gauge(head: Control, levels: StockLevels) -> Option<(u16, Rgb)> {
++    if let (Control::MediaPrevious, Some(progress)) = (head, levels.progress) {
++        return Some((progress, PROGRESS_FILL));
++    }
++    let (level, fill) = match head {
++        Control::DisplayDown => (levels.display_brightness, GAUGE_FILL),
++        Control::KeyboardDown => (levels.keyboard_backlight, GAUGE_FILL),
++        Control::Mute => (
++            levels.volume,
++            match levels.volume {
++                _ if levels.muted => MUTED_LABEL,
++                Some(volume) if volume > LOUD_VOLUME_PERCENT => LOUD_GAUGE_FILL,
++                _ => GAUGE_FILL,
++            },
++        ),
++        _ => (None, GAUGE_FILL),
++    };
++    match level {
++        Some(level) => Some((level as u16 * 10, fill)),
++        None => None,
++    }
++}
++
+ const fn control_symbol(control: Control) -> Symbol {
+     match control {
+         Control::DisplayDown => Symbol::DisplayDown,
+@@ -682,7 +949,7 @@ mod tests {
+         assert!(
+             normal
+                 .iter()
+-                .any(|channel| !matches!(*channel, 0 | 53 | 242))
++                .any(|channel| !matches!(*channel, 0 | 42 | 60 | 235))
+         );
+     }
+ 

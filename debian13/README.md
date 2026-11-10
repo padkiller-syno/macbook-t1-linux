@@ -18,7 +18,7 @@ t1bridge cible les kernels **7.x**. Deux modules ont dû être portés.
 | **Caméra** FaceTime HD | ✅ caméra virtuelle à la demande (Meet, Firefox, GNOME Caméra) | [`camera/`](camera/) |
 | **Écran noir / gel** (amdgpu Polaris) | ✅ niveau DPM fixe (`high`, ou `low` en économie d'énergie) |
 | **Profils d'énergie** (CPU, turbo, secteur) | ✅ économie 1200 MHz, équilibré sans turbo, performance turbo ; secteur → équilibré | [`display/`](#écran-noir--gel--amdgpu-polaris) |
-| **Clavier** `@` / `<` inversés | ✅ `applespi iso_layout=1` | [`../keyboard/`](../keyboard/README.md) |
+| **Clavier** `@` / `<` inversés | ✅ `applespi iso_layout=1` | [`../fedora44/keyboard/`](../fedora44/keyboard/README.md) |
 | **Touch ID** (sudo, polkit, verrouillage, GDM) | ✅ 2 doigts, 3 essais avant le mot de passe, Touch Bar en français | [`touchid/`](#touch-id) |
 | **Touch Bar : volume / média** | ✅ fournisseur bureau GNOME + PipeWire, jauges dans la Touch Bar | [`touchbar/desktop-provider/`](#touch-bar--volume-sourdine-média) |
 | **Touch Bar : look** | ✅ touches en capsules, icônes vectorielles, jauges, couleurs d'état | [`touchbar/`](#touch-bar--style-capsules-et-jauges) |

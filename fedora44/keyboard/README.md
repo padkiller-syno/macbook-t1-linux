@@ -14,7 +14,7 @@ codes mesurés ci-dessous. **Correction du diagnostic** : 86 n'est pas
 `KEY_ASTERISK` mais **`KEY_102ND`** (la touche `<>` des claviers ISO, `<LSGT>`) ;
 la touche `&` (`KEY_1`) n'est pas concernée.
 
-Script : [`../debian13/systeme/fix-clavier-iso.sh`](../debian13/systeme/fix-clavier-iso.sh).
+Script : [`../../debian13/systeme/fix-clavier-iso.sh`](../../debian13/systeme/fix-clavier-iso.sh).
 
 ---
 

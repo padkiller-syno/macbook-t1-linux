@@ -8,7 +8,7 @@ Le fix v1 (`amdgpu.dc=0`) est **banni** — il cassait l'affichage au boot.
 > via une règle udev (MCLK bloquée à 1270 MHz au lieu de basculer
 > 300 ↔ 1270 MHz). Applicable à chaud, réversible sans reboot. Devrait
 > s'appliquer tel quel sous Fedora. Détails et liste des essais ratés :
-> [`../debian13/README.md`](../debian13/README.md#écran-noir--gel--amdgpu-polaris).
+> [`../../debian13/README.md`](../../debian13/README.md#écran-noir--gel--amdgpu-polaris).
 
 ## Symptôme
 
@@ -64,7 +64,7 @@ Si l'écran noir persiste avec `sg_display=0` : relancer le moniteur
 `blacklog.sh` (à relancer après chaque reboot, il ne survit pas) :
 
 ```sh
-nohup ~/git/macbook-t1-fedora/display/blacklog.sh >> ~/t1-diag/blacklog.log 2>&1 &
+nohup ~/git/macbook-t1-linux/fedora44/display/blacklog.sh >> ~/t1-diag/blacklog.log 2>&1 &
 ```
 
 Colonnes : `time,backlight,edp_status,gpu_busy,amdgpu_temp`.

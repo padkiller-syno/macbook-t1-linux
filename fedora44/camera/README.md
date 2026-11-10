@@ -84,7 +84,7 @@ pourrait même ouvrir le device → le stub maintient la caméra virtuelle
 Tout est dans [`install/install-camera.sh`](../install/install-camera.sh) :
 
 ```sh
-sudo ~/git/macbook-t1-fedora/install/install-camera.sh
+sudo ~/git/macbook-t1-linux/fedora44/install/install-camera.sh
 ```
 
 Puis se déconnecter/reconnecter (ou reboot) pour que WirePlumber scanne.

@@ -1,0 +1,21 @@
+--- a/libfprint/drivers/t1bridge.c
++++ b/libfprint/drivers/t1bridge.c
+@@ -212,8 +212,16 @@
+ 
+   switch (outcome) {
+   case 5:
+-    error = g_error_new_literal (G_IO_ERROR, G_IO_ERROR_CANCELLED,
+-                                 "fingerprint operation cancelled");
++    /* Cancel not requested by fprintd = the Touch Bar's cancel button. fprintd turns
++     * G_IO_ERROR_CANCELLED into verify-no-match, which pam_fprintd counts as a missed
++     * try and retries; a general error makes it give up (PAM_AUTHINFO_UNAVAIL) so the
++     * PAM stack goes straight to the password. */
++    if (!self->cancel_sent && (self->pending == P_VERIFY || self->pending == P_IDENTIFY))
++      error = device_error (FP_DEVICE_ERROR_GENERAL,
++                            "fingerprint operation cancelled from the Touch Bar");
++    else
++      error = g_error_new_literal (G_IO_ERROR, G_IO_ERROR_CANCELLED,
++                                   "fingerprint operation cancelled");
+     break;
+   case 6:
+     error = device_error (FP_DEVICE_ERROR_REMOVED, "fingerprint device was removed");

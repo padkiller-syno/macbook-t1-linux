@@ -538,6 +538,22 @@ benoit », « Autorisation administrateur (polkit) »…), **les essais restants
   dans le renderer.
 - polkit ne transmet pas l'action demandée à PAM : texte générique.
 
+**La croix = mot de passe tout de suite.** À l'origine, annuler depuis la Touch
+Bar comptait comme un essai raté : le service renvoie « annulé » (code 5),
+`libfprint` en fait `G_IO_ERROR_CANCELLED`, que `fprintd` traduit en
+`verify-no-match`, et `pam_fprintd` relance un essai (3 croix pour atteindre
+le mot de passe, sans que les points bougent).
+[`touchid/patches/libfprint-t1bridge-croix-mot-de-passe.patch`](touchid/patches/libfprint-t1bridge-croix-mot-de-passe.patch) :
+une annulation **non demandée par fprintd** (`cancel_sent` faux, donc venue de
+la Touch Bar) devient `FP_DEVICE_ERROR_GENERAL` → `verify-unknown-error` →
+`PAM_AUTHINFO_UNAVAIL` : PAM passe directement au mot de passe. Les
+annulations de fprintd (délai, Ctrl-C) gardent leur comportement. Recompiler
+`libfprint` puis remplacer `/usr/lib/x86_64-linux-gnu/libfprint-2.so.2.0.0`
+et `systemctl stop fprintd` (relancé à la demande). Si l'ancien dossier de
+compilation pointe vers un chemin disparu : nouveau `meson setup` avec
+`-Dudev_rules=disabled -Dudev_hwdb=disabled` si `libudev-dev` manque (seules
+les règles udev en dépendent).
+
 ## Réglages système (revue du syslog)
 
 Revue de `journalctl -b -p warning` + kernel : aucune unité en échec,

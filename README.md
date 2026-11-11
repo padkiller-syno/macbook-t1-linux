@@ -33,7 +33,7 @@ configurer (projet [t1bridge](https://github.com/standardagents/t1bridge)).
 | **Touch Bar** | ✅ (t1bridge : modules portés en 6.12, d'origine en 7.2), allumée dès l'écran de connexion | [`touchbar/`](debian13/touchbar/) |
 | **Caméra** FaceTime HD | ✅ caméra virtuelle à la demande (Meet, Firefox, GNOME Caméra) | [`camera/`](debian13/camera/) |
 | **Écran noir / gel** (amdgpu Polaris) | ✅ niveau DPM fixe (`high`, ou `low` en économie d'énergie) |
-| **Profils d'énergie** (CPU, turbo, secteur) | ✅ économie 1200 MHz, équilibré sans turbo, performance turbo ; secteur → équilibré | [`display/`](debian13/README.md#écran-noir--gel--amdgpu-polaris) |
+| **Profils d'énergie** (CPU, turbo, secteur) | ✅ économie 2000 MHz + EPP `balance_power` (mesuré), équilibré sans turbo, performance turbo ; secteur → équilibré | [`display/`](debian13/README.md#écran-noir--gel--amdgpu-polaris) |
 | **Clavier** `@` / `<` inversés | ✅ `applespi iso_layout=1` | [`fedora44/keyboard/`](fedora44/keyboard/README.md) |
 | **Touch ID** (sudo, polkit, verrouillage, GDM) | ✅ 2 doigts, 3 essais avant le mot de passe, Touch Bar en français | [`touchid/`](debian13/README.md#touch-id) |
 | **Touch Bar : volume / média** | ✅ fournisseur bureau GNOME + PipeWire, jauges dans la Touch Bar | [`touchbar/desktop-provider/`](debian13/README.md#touch-bar--volume-sourdine-média) |

@@ -1,0 +1,11 @@
+# Mesure énergie 2026-11-11 11:40:19 — 7.2.11+deb13-amd64
+# luminosité=152/1023  batterie=48%
+# repos : moyenne sur 30 s ; tâche : xz -T0 -6 sur 256 Mo
+réglage                   |  repos W    CPU W Radeon W | tâche s  tâche J     CPU J  MHz moy
+1200:power                 |    18.96     5.44     7.08 |    88.5      1985     698.5      899
+1600:power                 |    18.52     5.21     7.08 |    89.0      1993     699.5      899
+1600:balance_power         |    18.60     5.30     7.09 |    48.0      1318     570.3     1583
+2000:balance_power         |    18.85     5.45     7.08 |    39.1      1202     587.3     1977
+2700:balance_power         |    19.74     6.35     7.09 |    36.7      1265     666.9     2196
+2700:balance_performance   |    19.49     5.92     7.09 |    29.5      1185     687.8     2692
+turbo:performance          |    23.35     9.31     7.08 |    25.3      1407     912.2     3210

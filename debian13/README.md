@@ -20,7 +20,7 @@ GNOME 48 / **Wayland**, LUKS + LVM. Session de remise en état du 20/10/2026.
 | **Touch Bar** | ✅ (t1bridge : modules portés en 6.12, d'origine en 7.2), allumée dès l'écran de connexion | [`touchbar/`](touchbar/) |
 | **Caméra** FaceTime HD | ✅ caméra virtuelle à la demande (Meet, Firefox, GNOME Caméra) | [`camera/`](camera/) |
 | **Écran noir / gel** (amdgpu Polaris) | ✅ niveau DPM fixe (`high`, ou `low` en économie d'énergie) |
-| **Profils d'énergie** (CPU, turbo, secteur) | ✅ économie 1200 MHz, équilibré sans turbo, performance turbo ; secteur → équilibré | [`display/`](#écran-noir--gel--amdgpu-polaris) |
+| **Profils d'énergie** (CPU, turbo, secteur) | ✅ économie 2000 MHz + EPP `balance_power` (mesuré), équilibré sans turbo, performance turbo ; secteur → équilibré | [`display/`](#écran-noir--gel--amdgpu-polaris) |
 | **Clavier** `@` / `<` inversés | ✅ `applespi iso_layout=1` | [`../fedora44/keyboard/`](../fedora44/keyboard/README.md) |
 | **Touch ID** (sudo, polkit, verrouillage, GDM) | ✅ 2 doigts, 3 essais avant le mot de passe, Touch Bar en français | [`touchid/`](#touch-id) |
 | **Touch Bar : volume / média** | ✅ fournisseur bureau GNOME + PipeWire, jauges dans la Touch Bar | [`touchbar/desktop-provider/`](#touch-bar--volume-sourdine-média) |
@@ -330,8 +330,8 @@ chargeur :
 
 | Profil GNOME | Turbo | Fréquence max (8 cœurs) | EPP (par power-profiles-daemon) |
 |---|---|---|---|
-| Économie d'énergie | off | **1200 MHz** (800 = trop lent) | `power` |
-| Équilibré | off | 2700 MHz | `balance_performance` |
+| Économie d'énergie | off | **2000 MHz** (1200 jusqu'au 11/11/2026, 800 = trop lent) | **`balance_power`** (réécrit par le service, voir la mesure plus bas) |
+| Équilibré | off | 2700 MHz | `balance_performance` sur secteur, `balance_power` sur batterie |
 | Performance | **on** | **3600 MHz** | `performance` |
 
 - Sans ce service, power-profiles-daemon ne change **que l'EPP** : aucune
@@ -344,10 +344,42 @@ chargeur :
   (`busctl set-property … ActiveProfile s balanced`). Seule la transition
   déclenche : repasser à la main en Économie sur secteur reste possible.
 
-Vérifié (journal `amdgpu-power-sync`) : économie → `cpu: max 1200 MHz`, puis
+Vérifié (journal `amdgpu-power-sync`) : économie → `cpu: max 2000 MHz` et
+`cpu: EPP balance_power`, puis
 `card0: low` 4 s plus tard ; chargeur branché → `secteur branché : économie
 d'énergie -> équilibré`, `card0: high`, `cpu: max 2700 MHz` dans la même
 seconde ; Performance → `turbo activé`, `max 3600 MHz`.
+
+### Mesure énergie / performance (11/11/2026)
+
+Script [`energie/mesure-energie.sh`](energie/mesure-energie.sh) (sudo, **sur
+batterie**) : pour chaque réglage `plafond:EPP`, 30 s de repos puis une tâche
+fixe (`xz -T0 -6` sur 256 Mo) ; énergie totale par la batterie (courant ×
+tension, 1/s), CPU par Intel RAPL, Radeon par le capteur `amdgpu` (PPT). Il
+met `amdgpu-power-sync` en pause et restaure tout en sortie. Résultats bruts :
+[`energie/resultats-2026-11-11.txt`](energie/resultats-2026-11-11.txt).
+
+| Réglage (Radeon `low`) | Tâche | Énergie tâche | Repos |
+|---|---|---|---|
+| 1200 MHz, EPP `power` (ancienne économie) | 88 s | 1 985 J | 19,0 W |
+| 1600 MHz, EPP `power` | 89 s | 1 993 J | 18,5 W |
+| 1600 MHz, EPP `balance_power` | 48 s | 1 318 J | 18,6 W |
+| **2000 MHz, EPP `balance_power`** (nouvelle économie) | **39 s** | **1 202 J** | 18,9 W |
+| 2700 MHz, EPP `balance_power` | 37 s | 1 265 J | 19,7 W |
+| 2700 MHz, EPP `balance_performance` | 30 s | 1 185 J | 19,5 W |
+| turbo, EPP `performance` | 25 s | 1 407 J | 23,4 W |
+
+- Avec l'EPP `power`, le CPU reste vers **900 MHz quel que soit le plafond** :
+  c'est l'EPP qui décide, pas `scaling_max_freq` (HWP : le processeur choisit
+  sa fréquence lui-même).
+- La machine consomme **~19 W au repos** (Radeon 7 W même en `low`, CPU 5,4 W,
+  écran et reste ~6,5 W) : une tâche lente paie ce socle plus longtemps,
+  l'ancienne économie coûtait 65 % d'énergie en plus par tâche.
+- Le turbo ajoute ~4 W **au repos** : à garder pour le profil Performance.
+- ⚠️ Forcer la Radeon de `low` à `high` sur batterie pendant le test a figé la
+  machine (reboot) : cas non mesuré, ne pas le rejouer.
+- Piège : ne pas modifier un script bash pendant qu'il tourne (bash le lit au
+  fil de l'eau ; le premier essai a exécuté du texte décalé).
 
 Lire le journal sans sudo : `sudo usermod -aG systemd-journal $USER`, puis se
 reconnecter ; ensuite `journalctl -t amdgpu-power-sync -b`.

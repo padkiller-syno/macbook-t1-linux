@@ -507,6 +507,37 @@ ce sont **5 masques alpha précalculés** (`overlay_labels.rs`, Inter Medium
 `systemctl --user restart t1-touchbar.service`. Les 96 tests du crate passent
 (la largeur des libellés est libre, mise à l'échelle par le renderer).
 
+### Touch Bar : ce qu'on autorise, essais, délai
+
+![Touch ID sur la Touch Bar](touchid/apercu-touchid.png)
+
+Pendant l'attente du doigt, la partie libre de la barre affiche **ce que l'on
+autorise** (« sudo : apt full-upgrade », « Déverrouiller la session de
+benoit », « Autorisation administrateur (polkit) »…), **les essais restants**
+(points ; rouge juste après un échec) et **le délai** de l'essai en cours
+(barre qui se vide en 30 s, orange dans les 5 dernières).
+
+- [`touchid/touchid-context`](touchid/touchid-context), appelé par `pam_exec`
+  **juste avant `pam_fprintd`** (`common-auth`, `gdm-fingerprint`), écrit
+  `/run/t1bridge/touch-id-context` (`root:t1bridge 0640`) : service PAM, texte,
+  essais, délai. Pour sudo, la commande est la ligne de commande du processus
+  parent (sudo lui-même). Il sort toujours en 0 ; la ligne est `optional`.
+- Installation / retrait :
+  [`touchid/install-touchid-context.sh`](touchid/install-touchid-context.sh)
+  (`… annuler` pour retirer ; sauvegardes dans `/root/backup-pam/`). Essais et
+  délai sont repris de la ligne `pam_fprintd` de `common-auth`.
+- **Piège** : sans l'option `seteuid`, `pam_exec` lance le script sous
+  l'utilisateur **réel** (pas root) : il ne peut pas écrire dans
+  `/run/t1bridge` et rien ne s'affiche, sans aucune erreur (`quiet`).
+- Chaque essai de `pam_fprintd` est une séance Touch ID distincte : le
+  renderer compte les échecs tant que l'horodatage du contexte ne change pas
+  (même demande PAM) ; un contexte de plus de 2 min est ignoré.
+- Texte : police Inter embarquée en masques alpha
+  ([`touchbar/touchbar-font.py`](touchbar/touchbar-font.py) →
+  `overlay_font.rs`, 134 caractères dont les accents), sans moteur de police
+  dans le renderer.
+- polkit ne transmet pas l'action demandée à PAM : texte générique.
+
 ## Réglages système (revue du syslog)
 
 Revue de `journalctl -b -p warning` + kernel : aucune unité en échec,

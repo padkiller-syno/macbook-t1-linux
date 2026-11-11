@@ -782,10 +782,12 @@ veilleuse et la luminosité auto → ~150 ms en mode économie.
 
 ### Panneau d'applications
 
-La touche **grille** à droite d'esc remplace les contrôles par une page
-d'icônes en couleur ; un appui lance l'application et ramène la page normale,
-**×** referme sans rien lancer. Pour faire de la place, esc passe à 140 px et
-les contrôles à 176 px (au lieu de 182).
+La touche **grille** est dans la **rangée Fn**, juste après esc (fn maintenue :
+esc, grille, F1…F12 sur 14 touches ; sans application configurée, la rangée Fn
+reste à 13 touches). Un appui ouvre la page d'icônes en couleur, affichée une
+fois fn relâchée : esc, **×** pour refermer, puis les applications ; un appui
+sur une icône lance l'application et ramène la page normale. La rangée normale
+garde sa disposition (esc large, contrôles de 182 px).
 
 - liste : [`apps.conf`](touchbar/desktop-provider/apps.conf) →
   `~/.config/t1bridge/apps.conf`, un identifiant `.desktop` par ligne (Flatpak

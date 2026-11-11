@@ -1759,10 +1759,10 @@ index 6e733d7..e1559a4 100644
 +    pixels: CLOSE_PIXELS,
 +};
 diff --git a/crates/t1-touchbar/src/stock_slice.rs b/crates/t1-touchbar/src/stock_slice.rs
-index 4c0ae87..863baa3 100644
+index 4c0ae87..5e2cdb5 100644
 --- a/crates/t1-touchbar/src/stock_slice.rs
 +++ b/crates/t1-touchbar/src/stock_slice.rs
-@@ -4,36 +4,127 @@ use std::{error::Error, fmt};
+@@ -4,36 +4,126 @@ use std::{error::Error, fmt};
  
  use crate::framebuffer::{FramebufferError, Rectangle, Rgb, Xrgb8888Frame};
  use crate::gesture::{DisplayContact, Gesture};
@@ -1774,11 +1774,10 @@ index 4c0ae87..863baa3 100644
  const NATIVE_HEIGHT: u32 = 60;
  const ACTIVE_RIGHT: u32 = NATIVE_WIDTH;
  const FUNCTION_SLOT_COUNT: u32 = 13;
-+/// Normal row: a narrower escape, then the launcher key, then the controls.
-+const NORMAL_ESCAPE_WIDTH: u32 = 140;
-+const APPS_KEY_X: u32 = 148;
-+const APPS_KEY_WIDTH: u32 = 102;
-+/// Launcher page: icons share the span the controls use in the normal row.
++/// The launcher key lives in the fn row, right after escape (one slot more).
++/// Launcher page (fn released): escape, a close key, then the icons.
++const APPS_CLOSE_X: u32 = 170;
++const APPS_CLOSE_WIDTH: u32 = 92;
 +const APPS_AREA_X: u32 = 278;
  const PLATE_Y: u32 = 0;
  const PLATE_HEIGHT: u32 = 60;
@@ -1903,7 +1902,7 @@ index 4c0ae87..863baa3 100644
  };
  
  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-@@ -90,6 +181,12 @@ pub struct StockLevels {
+@@ -90,6 +180,12 @@ pub struct StockLevels {
      pub keyboard_backlight: Option<u8>,
      pub volume: Option<u8>,
      pub muted: bool,
@@ -1916,7 +1915,7 @@ index 4c0ae87..863baa3 100644
  }
  
  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-@@ -103,6 +200,10 @@ pub enum StockAction {
+@@ -103,6 +199,10 @@ pub enum StockAction {
      MediaPrevious,
      MediaPlayPause,
      MediaNext,
@@ -1927,77 +1926,7 @@ index 4c0ae87..863baa3 100644
  }
  
  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-@@ -161,56 +262,59 @@ struct NativeControl {
- const NORMAL_CONTROLS: [NativeControl; 10] = [
-     NativeControl {
-         control: Control::DisplayDown,
--        x: 194,
--        width: 182,
-+        x: 278,
-+        width: 176,
-     },
-     NativeControl {
-         control: Control::DisplayUp,
--        x: 384,
--        width: 182,
-+        x: 462,
-+        width: 176,
-     },
-     NativeControl {
-         control: Control::KeyboardDown,
--        x: 602,
--        width: 182,
-+        x: 666,
-+        width: 176,
-     },
-     NativeControl {
-         control: Control::KeyboardUp,
--        x: 792,
--        width: 182,
-+        x: 850,
-+        width: 176,
-     },
-     NativeControl {
-         control: Control::MediaPrevious,
--        x: 1_010,
--        width: 182,
-+        x: 1_054,
-+        width: 176,
-     },
-     NativeControl {
-         control: Control::MediaPlayPause,
--        x: 1_200,
--        width: 182,
-+        x: 1_238,
-+        width: 176,
-     },
-     NativeControl {
-         control: Control::MediaNext,
--        x: 1_390,
--        width: 182,
-+        x: 1_422,
-+        width: 176,
-     },
-     NativeControl {
-         control: Control::Mute,
--        x: 1_608,
--        width: 182,
-+        x: 1_626,
-+        width: 176,
-     },
-     NativeControl {
-         control: Control::VolumeDown,
--        x: 1_798,
--        width: 182,
-+        x: 1_810,
-+        width: 176,
-     },
-     NativeControl {
-         control: Control::VolumeUp,
--        x: 1_988,
--        width: 182,
-+        x: 1_994,
-+        width: 176,
+@@ -211,6 +311,9 @@ const NORMAL_CONTROLS: [NativeControl; 10] = [
      },
  ];
  
@@ -2007,7 +1936,7 @@ index 4c0ae87..863baa3 100644
  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
  struct LaidOutControl {
      control: Control,
-@@ -223,6 +327,8 @@ pub struct StockBar {
+@@ -223,6 +326,8 @@ pub struct StockBar {
      width: u32,
      height: u32,
      capabilities: StockCapabilities,
@@ -2016,7 +1945,7 @@ index 4c0ae87..863baa3 100644
  }
  
  impl StockBar {
-@@ -241,10 +347,27 @@ impl StockBar {
+@@ -241,10 +346,27 @@ impl StockBar {
                  width,
                  height,
                  capabilities,
@@ -2044,7 +1973,7 @@ index 4c0ae87..863baa3 100644
      #[must_use]
      pub const fn width(self) -> u32 {
          self.width
-@@ -273,17 +396,18 @@ impl StockBar {
+@@ -273,17 +395,18 @@ impl StockBar {
          self.render_pressed(frame, fn_held, levels, None)
      }
  
@@ -2065,7 +1994,7 @@ index 4c0ae87..863baa3 100644
      ) -> Result<(), StockSliceError> {
          if frame.width() != self.width || frame.height() != self.height {
              return Err(StockSliceError::FrameGeometryMismatch);
-@@ -292,10 +416,25 @@ impl StockBar {
+@@ -292,10 +415,25 @@ impl StockBar {
          if fn_held {
              self.render_function_row(frame, pressed)
          } else {
@@ -2092,14 +2021,14 @@ index 4c0ae87..863baa3 100644
      /// Maps a completed tap to one currently visible action.
      #[must_use]
      pub fn action_for_gesture(self, gesture: Gesture, fn_held: bool) -> Option<StockAction> {
-@@ -319,6 +458,14 @@ impl StockBar {
+@@ -319,6 +457,14 @@ impl StockBar {
          if contains(self.escape_bounds(), x, y) {
              return Some(StockAction::Escape);
          }
-+        if self.app_count > 0 && contains(self.apps_key_bounds(), x, y) {
-+            return Some(StockAction::ToggleApps);
-+        }
 +        if self.apps_open {
++            if contains(self.apps_close_bounds(), x, y) {
++                return Some(StockAction::ToggleApps);
++            }
 +            return (0..self.app_count)
 +                .find(|index| contains(self.app_slot(*index), x, y))
 +                .map(StockAction::LaunchApp);
@@ -2107,7 +2036,7 @@ index 4c0ae87..863baa3 100644
          self.normal_controls()
              .into_iter()
              .find(|item| self.control_available(item.control) && contains(item.bounds, x, y))
-@@ -328,23 +475,209 @@ impl StockBar {
+@@ -328,36 +474,224 @@ impl StockBar {
      fn render_normal_row(
          self,
          frame: &mut Xrgb8888Frame<'_>,
@@ -2127,13 +2056,10 @@ index 4c0ae87..863baa3 100644
          stock_art::draw_label(frame, self.escape_bounds(), stock_labels::ESC, LABEL)?;
 -        for item in self.normal_controls() {
 -            if !self.control_visible(item.control) {
-+        if self.app_count > 0 {
-+            let key = self.apps_key_bounds();
-+            self.draw_plate(frame, key, CAPSULE_RADIUS, StockAction::ToggleApps, pressed)?;
-+            let symbol = if self.apps_open { Symbol::Close } else { Symbol::Apps };
-+            stock_art::draw_symbol(frame, key, symbol, LABEL)?;
-+        }
 +        if self.apps_open {
++            let key = self.apps_close_bounds();
++            self.draw_plate(frame, key, CAPSULE_RADIUS, StockAction::ToggleApps, pressed)?;
++            stock_art::draw_symbol(frame, key, Symbol::Close, LABEL)?;
 +            return self.render_apps(frame, pressed, apps);
 +        }
 +        let controls = self.normal_controls();
@@ -2325,16 +2251,29 @@ index 4c0ae87..863baa3 100644
      fn render_function_row(
          self,
          frame: &mut Xrgb8888Frame<'_>,
-@@ -356,7 +689,7 @@ impl StockBar {
+         pressed: Option<StockAction>,
+     ) -> Result<(), StockSliceError> {
+-        for slot in 0..FUNCTION_SLOT_COUNT {
++        for slot in 0..self.function_slot_count() {
+             let bounds = self.function_slot(slot);
+             if bounds.width == 0 {
                  continue;
              }
-             let action = function_action(slot).ok_or(StockSliceError::InvalidGeometry)?;
+-            let action = function_action(slot).ok_or(StockSliceError::InvalidGeometry)?;
 -            self.draw_plate(frame, bounds, action, pressed)?;
+-            stock_art::draw_label(frame, bounds, function_label(action)?, LABEL)?;
++            let action = self.function_action(slot).ok_or(StockSliceError::InvalidGeometry)?;
 +            self.draw_plate(frame, bounds, CAPSULE_RADIUS, action, pressed)?;
-             stock_art::draw_label(frame, bounds, function_label(action)?, LABEL)?;
++            if action == StockAction::ToggleApps {
++                let symbol = if self.apps_open { Symbol::Close } else { Symbol::Apps };
++                stock_art::draw_symbol(frame, bounds, symbol, LABEL)?;
++            } else {
++                stock_art::draw_label(frame, bounds, function_label(action)?, LABEL)?;
++            }
          }
          Ok(())
-@@ -366,19 +699,16 @@ impl StockBar {
+     }
+@@ -366,19 +700,16 @@ impl StockBar {
          self,
          frame: &mut Xrgb8888Frame<'_>,
          bounds: Rectangle,
@@ -2361,22 +2300,50 @@ index 4c0ae87..863baa3 100644
          Ok(())
      }
  
-@@ -397,7 +727,35 @@ impl StockBar {
+@@ -387,23 +718,71 @@ impl StockBar {
+             return None;
+         }
+         let slot = u32::try_from(
+-            u64::from(x) * u64::from(FUNCTION_SLOT_COUNT) / u64::from(self.active_right()),
++            u64::from(x) * u64::from(self.function_slot_count()) / u64::from(self.active_right()),
+         )
+         .ok()?;
+         let bounds = self.function_slot(slot);
+         contains(bounds, x, y)
+-            .then(|| function_action(slot))
++            .then(|| self.function_action(slot))
+             .flatten()
      }
  
-     fn escape_bounds(self) -> Rectangle {
--        self.function_slot(0)
-+        Rectangle {
-+            width: self.scaled_x(NORMAL_ESCAPE_WIDTH).max(1),
-+            ..self.function_slot(0)
++    /// Escape plus F1-F12, and the launcher key after escape when apps exist.
++    const fn function_slot_count(self) -> u32 {
++        if self.app_count > 0 {
++            FUNCTION_SLOT_COUNT + 1
++        } else {
++            FUNCTION_SLOT_COUNT
 +        }
 +    }
 +
-+    fn apps_key_bounds(self) -> Rectangle {
++    const fn function_action(self, slot: u32) -> Option<StockAction> {
++        match (self.app_count > 0, slot) {
++            (true, 1) => Some(StockAction::ToggleApps),
++            (true, 0) => function_action(0),
++            (true, _) => function_action(slot - 1),
++            (false, _) => function_action(slot),
++        }
++    }
++
++    /// Normal-row escape keeps the 13-slot width whether or not the launcher exists.
+     fn escape_bounds(self) -> Rectangle {
+-        self.function_slot(0)
++        self.function_slot_of(0, FUNCTION_SLOT_COUNT)
++    }
++
++    fn apps_close_bounds(self) -> Rectangle {
 +        Rectangle {
-+            x: self.scaled_x(APPS_KEY_X),
++            x: self.scaled_x(APPS_CLOSE_X),
 +            y: self.scaled_y(PLATE_Y),
-+            width: self.scaled_x(APPS_KEY_WIDTH).max(1),
++            width: self.scaled_x(APPS_CLOSE_WIDTH).max(1),
 +            height: self.scaled_y(PLATE_HEIGHT).max(1),
 +        }
 +    }
@@ -2398,7 +2365,19 @@ index 4c0ae87..863baa3 100644
      }
  
      fn function_slot(self, slot: u32) -> Rectangle {
-@@ -506,6 +864,55 @@ const fn control_action(control: Control) -> StockAction {
++        self.function_slot_of(slot, self.function_slot_count())
++    }
++
++    fn function_slot_of(self, slot: u32, count: u32) -> Rectangle {
+         let active_right = self.active_right();
+-        let left = ceiling_partition(slot, active_right, FUNCTION_SLOT_COUNT);
+-        let right = ceiling_partition(slot + 1, active_right, FUNCTION_SLOT_COUNT);
++        let left = ceiling_partition(slot, active_right, count);
++        let right = ceiling_partition(slot + 1, active_right, count);
+         let inset = self.scaled_x(5).min((right - left) / 2);
+         let left_inset = if slot == 0 { 0 } else { inset };
+         Rectangle {
+@@ -506,6 +885,55 @@ const fn control_action(control: Control) -> StockAction {
      }
  }
  
@@ -2454,16 +2433,43 @@ index 4c0ae87..863baa3 100644
  const fn control_symbol(control: Control) -> Symbol {
      match control {
          Control::DisplayDown => Symbol::DisplayDown,
-@@ -611,7 +1018,7 @@ mod tests {
-         assert_eq!(bar.escape_bounds().x, 0);
-         let items = bar.normal_controls();
-         assert_eq!(items.len(), 10);
--        assert_eq!(items[0].bounds.x, 194);
-+        assert_eq!(items[0].bounds.x, 278);
-         assert_eq!(items[9].bounds.x + items[9].bounds.width, NATIVE_WIDTH);
-         for item in items {
-             let action = bar.action_at(
-@@ -682,7 +1089,7 @@ mod tests {
+@@ -605,6 +1033,35 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn launcher_key_follows_escape_in_the_fn_row_only() {
++        let bar = StockBar::new(NATIVE_WIDTH, NATIVE_HEIGHT, all())
++            .unwrap()
++            .with_apps(3, false);
++        let key = bar.function_slot(1);
++        assert_eq!(
++            bar.action_for_gesture(tap(f64::from(key.x + key.width / 2), 30.0), true),
++            Some(StockAction::ToggleApps)
++        );
++        let last = bar.function_slot(13);
++        assert_eq!(
++            bar.action_for_gesture(tap(f64::from(last.x + last.width / 2), 30.0), true),
++            Some(StockAction::Function(FunctionKey::F12))
++        );
++        assert_eq!(bar.escape_bounds(), StockBar::new(NATIVE_WIDTH, NATIVE_HEIGHT, all()).unwrap().escape_bounds());
++        let open = bar.with_apps(3, true);
++        let close = open.apps_close_bounds();
++        assert_eq!(
++            open.action_for_gesture(tap(f64::from(close.x + 5), 30.0), false),
++            Some(StockAction::ToggleApps)
++        );
++        let first = open.app_slot(0);
++        assert_eq!(
++            open.action_for_gesture(tap(f64::from(first.x + 5), 30.0), false),
++            Some(StockAction::LaunchApp(0))
++        );
++    }
++
+     #[test]
+     fn normal_row_uses_fixed_grouped_controls() {
+         let bar = StockBar::new(NATIVE_WIDTH, NATIVE_HEIGHT, all()).unwrap();
+@@ -682,7 +1139,7 @@ mod tests {
          assert!(
              normal
                  .iter()

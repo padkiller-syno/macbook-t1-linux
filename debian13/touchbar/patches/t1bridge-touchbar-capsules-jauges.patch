@@ -1,5 +1,110 @@
+diff --git a/crates/t1-daemons/c/t1_seqpacket.c b/crates/t1-daemons/c/t1_seqpacket.c
+index 7957bda..b996756 100644
+--- a/crates/t1-daemons/c/t1_seqpacket.c
++++ b/crates/t1-daemons/c/t1_seqpacket.c
+@@ -267,6 +267,26 @@ enum t1_seqpacket_status t1_seqpacket_adopt_systemd_listener_pair(
+ 	return T1_SEQPACKET_OK;
+ }
+ 
++enum t1_seqpacket_status t1_seqpacket_wait_readable(int client_descriptor,
++	int timeout_ms, int *ready)
++{
++	struct pollfd descriptor;
++	int result;
++
++	if (ready == NULL || client_descriptor < 0 || timeout_ms < 0)
++		return T1_SEQPACKET_INVALID_ARGUMENT;
++	*ready = 0;
++	memset(&descriptor, 0, sizeof(descriptor));
++	descriptor.fd = client_descriptor;
++	descriptor.events = POLLIN;
++	result = poll(&descriptor, 1, timeout_ms);
++	if (result < 0)
++		return errno == EINTR ? T1_SEQPACKET_OK
++			: transient_status(errno, T1_SEQPACKET_READINESS_FAILED);
++	*ready = descriptor.revents != 0;
++	return T1_SEQPACKET_OK;
++}
++
+ enum t1_seqpacket_status t1_seqpacket_listener_ready(
+ 	int listener_descriptor, int *ready)
+ {
+diff --git a/crates/t1-daemons/c/t1_seqpacket.h b/crates/t1-daemons/c/t1_seqpacket.h
+index bbf979e..c18b127 100644
+--- a/crates/t1-daemons/c/t1_seqpacket.h
++++ b/crates/t1-daemons/c/t1_seqpacket.h
+@@ -72,6 +72,13 @@ enum t1_seqpacket_status t1_seqpacket_adopt_systemd_listener_pair(
+ enum t1_seqpacket_status t1_seqpacket_listener_ready(
+ 	int listener_descriptor, int *ready);
+ 
++/*
++ * Wait up to timeout_ms for a connected client to become readable. Hang-up or
++ * error also reports ready, so the following receive surfaces the condition.
++ */
++enum t1_seqpacket_status t1_seqpacket_wait_readable(int client_descriptor,
++	int timeout_ms, int *ready);
++
+ /*
+  * Accept from a caller-owned AF_UNIX SOCK_SEQPACKET listener. The returned
+  * descriptor is close-on-exec and nonblocking. This function never creates,
+diff --git a/crates/t1-platform/src/ffi.rs b/crates/t1-platform/src/ffi.rs
+index c1a679a..288db7a 100644
+--- a/crates/t1-platform/src/ffi.rs
++++ b/crates/t1-platform/src/ffi.rs
+@@ -320,6 +320,12 @@ unsafe extern "C" {
+         second_listener_descriptor: *mut c_int,
+     ) -> c_int;
+     #[cfg(feature = "seqpacket")]
++    fn t1_seqpacket_wait_readable(
++        client_descriptor: c_int,
++        timeout_ms: c_int,
++        ready: *mut c_int,
++    ) -> c_int;
++    #[cfg(feature = "seqpacket")]
+     fn t1_seqpacket_listener_ready(listener_descriptor: c_int, ready: *mut c_int) -> c_int;
+     #[cfg(feature = "seqpacket")]
+     fn t1_seqpacket_accept(listener_descriptor: c_int, client_descriptor: *mut c_int) -> c_int;
+@@ -1458,6 +1464,15 @@ pub(super) fn effective_group_is_root_for_test() -> bool {
+     unsafe { c_getegid() == 0 }
+ }
+ 
++#[cfg(feature = "seqpacket")]
++pub(super) fn wait_readable(client: RawFd, timeout_ms: c_int) -> (c_int, bool) {
++    let mut ready = 0;
++    // SAFETY: `ready` is writable for one C `int`; `client` stays borrowed and
++    // open for the bounded poll, which reads no data.
++    let status = unsafe { t1_seqpacket_wait_readable(client, timeout_ms, &raw mut ready) };
++    (status, ready != 0)
++}
++
+ #[cfg(feature = "seqpacket")]
+ pub(super) fn peer_closed(client: RawFd) -> (c_int, bool) {
+     let mut peer_closed = 0;
+diff --git a/crates/t1-platform/src/seqpacket.rs b/crates/t1-platform/src/seqpacket.rs
+index 8ce6a4b..ba3f938 100644
+--- a/crates/t1-platform/src/seqpacket.rs
++++ b/crates/t1-platform/src/seqpacket.rs
+@@ -365,6 +365,18 @@ impl<'fd> SeqPacketClient<'fd> {
+         Ok(peer_closed)
+     }
+ 
++    /// Sleeps until a packet (or hang-up) is pending, at most `timeout`.
++    ///
++    /// # Errors
++    ///
++    /// Returns a static error when the bounded readiness poll fails.
++    pub fn wait_readable(self, timeout: std::time::Duration) -> Result<bool, SeqPacketError> {
++        let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
++        let (status, ready) = ffi::wait_readable(self.descriptor.as_raw_fd(), millis);
++        check(status)?;
++        Ok(ready)
++    }
++
+     /// Receives one complete packet without blocking.
+     ///
+     /// # Errors
 diff --git a/crates/t1-touchbar/src/builtin_renderer.rs b/crates/t1-touchbar/src/builtin_renderer.rs
-index 90cead9..a46a1af 100644
+index 90cead9..ca465e6 100644
 --- a/crates/t1-touchbar/src/builtin_renderer.rs
 +++ b/crates/t1-touchbar/src/builtin_renderer.rs
 @@ -20,6 +20,7 @@ use t1_touchbar_hw::wire::{
@@ -10,7 +115,13 @@ index 90cead9..a46a1af 100644
  use crate::gesture::{DisplayContact, GestureEngine, GestureSettings};
  use crate::overlay_state::{OverlayState, OverlayWatcher};
  use crate::stock_slice::{
-@@ -36,6 +37,11 @@ const RECEIVE_RETRY_DELAY: Duration = Duration::from_millis(5);
+@@ -33,9 +34,17 @@ const MAX_PENDING_REQUESTS: usize = 64;
+ const SEND_ATTEMPTS: usize = 64;
+ const SEND_RETRY_DELAY: Duration = Duration::from_millis(2);
+ const RECEIVE_RETRY_DELAY: Duration = Duration::from_millis(5);
++/// With nothing animating, the loop sleeps on the socket this long at most:
++/// touches and acks still wake it at once; provider and overlay polls lag ≤ 100 ms.
++const IDLE_RECEIVE_WAIT: Duration = Duration::from_millis(100);
  const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(50);
  const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(2);
  const VOLUME_STEP_PERCENT: u8 = 6;
@@ -22,7 +133,24 @@ index 90cead9..a46a1af 100644
  const HOLD_REPEAT_DELAY: Duration = Duration::from_millis(350);
  const HOLD_REPEAT_INTERVAL: Duration = Duration::from_millis(90);
  const OVERLAY_FADE_DURATION: Duration = Duration::from_millis(150);
-@@ -339,6 +345,15 @@ struct RendererSession {
+@@ -125,7 +134,15 @@ fn run_once(provider: Option<&DesktopProvider>) -> Result<(), BuiltinRendererErr
+         if let Some(envelope) = connection.try_receive_service(Some(dimensions))? {
+             session.handle_with_provider(envelope, &connection, provider)?;
+         } else {
+-            thread::sleep(RECEIVE_RETRY_DELAY);
++            let wait = if session.needs_frequent_ticks() {
++                RECEIVE_RETRY_DELAY
++            } else {
++                IDLE_RECEIVE_WAIT
++            };
++            // a poll failure falls back to the old fixed nap instead of spinning
++            if connection.client().wait_readable(wait).is_err() {
++                thread::sleep(RECEIVE_RETRY_DELAY);
++            }
+         }
+     }
+ }
+@@ -339,6 +356,15 @@ struct RendererSession {
      pending_desktop_state: Option<DesktopState>,
      display_off: bool,
      levels: StockLevels,
@@ -38,7 +166,7 @@ index 90cead9..a46a1af 100644
      touch_id: TouchIdOverlay,
      overlay_state: Option<OverlayState>,
      overlay_visual_state: Option<OverlayState>,
-@@ -390,6 +405,15 @@ impl RendererSession {
+@@ -390,6 +416,15 @@ impl RendererSession {
              pending_desktop_state: None,
              display_off: false,
              levels: StockLevels::default(),
@@ -54,7 +182,7 @@ index 90cead9..a46a1af 100644
              touch_id,
              overlay_state: None,
              overlay_visual_state: None,
-@@ -636,6 +660,9 @@ impl RendererSession {
+@@ -636,6 +671,9 @@ impl RendererSession {
          }
          match action {
              StockAction::StepDisplayBrightness(direction) => {
@@ -64,7 +192,7 @@ index 90cead9..a46a1af 100644
                  let feedback = self
                      .desktop_state
                      .capabilities
-@@ -648,6 +675,9 @@ impl RendererSession {
+@@ -648,6 +686,9 @@ impl RendererSession {
                  )
              }
              StockAction::StepKeyboardBacklight(direction) => {
@@ -74,7 +202,7 @@ index 90cead9..a46a1af 100644
                  let feedback = self
                      .desktop_state
                      .capabilities
-@@ -661,7 +691,7 @@ impl RendererSession {
+@@ -661,7 +702,7 @@ impl RendererSession {
              }
              StockAction::ToggleMute => {
                  self.levels.muted = !self.levels.muted;
@@ -83,7 +211,7 @@ index 90cead9..a46a1af 100644
                  dispatch_desktop(provider, DesktopAction::ToggleMute);
                  Ok(())
              }
-@@ -672,7 +702,7 @@ impl RendererSession {
+@@ -672,7 +713,7 @@ impl RendererSession {
                      StepDirection::Up => current.saturating_add(VOLUME_STEP_PERCENT).min(100),
                  };
                  self.levels.volume = Some(value);
@@ -92,7 +220,7 @@ index 90cead9..a46a1af 100644
                  dispatch_desktop(provider, DesktopAction::SetVolume(value));
                  Ok(())
              }
-@@ -681,6 +711,8 @@ impl RendererSession {
+@@ -681,6 +722,8 @@ impl RendererSession {
                  Ok(())
              }
              StockAction::MediaPlayPause => {
@@ -101,7 +229,7 @@ index 90cead9..a46a1af 100644
                  dispatch_desktop(provider, DesktopAction::MediaPlayPause);
                  Ok(())
              }
-@@ -688,6 +720,19 @@ impl RendererSession {
+@@ -688,6 +731,19 @@ impl RendererSession {
                  dispatch_desktop(provider, DesktopAction::MediaNext);
                  Ok(())
              }
@@ -121,7 +249,7 @@ index 90cead9..a46a1af 100644
              StockAction::Escape | StockAction::Function(_) => unreachable!(),
          }
      }
-@@ -745,6 +790,7 @@ impl RendererSession {
+@@ -745,6 +801,7 @@ impl RendererSession {
              self.frame.as_mut_slice().fill(0);
              return Ok(());
          }
@@ -129,7 +257,7 @@ index 90cead9..a46a1af 100644
          let mut frame = Xrgb8888Frame::new(
              self.dimensions.width(),
              self.dimensions.height(),
-@@ -754,7 +800,18 @@ impl RendererSession {
+@@ -754,7 +811,18 @@ impl RendererSession {
          .map_err(|_| BuiltinRendererError::Frame)?;
          let fn_visible = self.input.fn_pressed() && self.overlay_visual_state.is_none();
          self.stock
@@ -149,7 +277,7 @@ index 90cead9..a46a1af 100644
              .map_err(|_| BuiltinRendererError::Frame)?;
          if self.overlay_opacity > 0 {
              let left = self.stock.escape_right();
-@@ -777,6 +834,9 @@ impl RendererSession {
+@@ -777,6 +845,9 @@ impl RendererSession {
                      .map_err(|_| BuiltinRendererError::Frame)?;
              }
          }
@@ -159,7 +287,7 @@ index 90cead9..a46a1af 100644
          self.touch_id
              .render_with_progress(
                  &mut frame,
-@@ -793,6 +853,9 @@ impl RendererSession {
+@@ -793,6 +864,9 @@ impl RendererSession {
              return;
          }
          let state_changed = self.overlay_state != state;
@@ -169,7 +297,7 @@ index 90cead9..a46a1af 100644
          self.overlay_state = state;
          self.enrollment_progress = progress;
          self.enrollment_progress_start = self.enrollment_progress_visual;
-@@ -832,6 +895,9 @@ impl RendererSession {
+@@ -832,6 +906,9 @@ impl RendererSession {
          self.now = now;
          self.advance_overlay_fade(now);
          self.advance_enrollment_progress(now);
@@ -179,7 +307,7 @@ index 90cead9..a46a1af 100644
          if !self.display_off
              && !self.input.wait_for_touch_release
              && let Some(action) = self.input.take_repeat(now)
-@@ -841,6 +907,129 @@ impl RendererSession {
+@@ -841,6 +918,129 @@ impl RendererSession {
          self.submit_if_ready(connection)
      }
  
@@ -309,10 +437,24 @@ index 90cead9..a46a1af 100644
      fn advance_overlay_fade(&mut self, now: Duration) {
          if self.overlay_opacity == self.overlay_target_opacity {
              return;
-@@ -888,7 +1077,27 @@ impl RendererSession {
+@@ -888,7 +1088,41 @@ impl RendererSession {
          self.dirty = true;
      }
  
++    /// Whether something advances on its own and needs the 5 ms loop: a frame to
++    /// send, an active touch or key repeat, a fade or gauge easing, or the Touch ID
++    /// countdown. Otherwise the loop can sleep until input arrives.
++    fn needs_frequent_ticks(&self) -> bool {
++        self.dirty
++            || !self.input.is_idle()
++            || self.overlay_opacity != self.overlay_target_opacity
++            || self.overlay_visual_state.is_some()
++            || self.enrollment_progress_visual != self.enrollment_progress_target
++            || self.shown_levels.display_brightness != self.levels.display_brightness
++            || self.shown_levels.keyboard_backlight != self.levels.keyboard_backlight
++            || self.shown_levels.volume != self.levels.volume
++    }
++
 +    /// Rebuilds the bar geometry for the launcher entries and page state.
 +    fn set_apps_page(&mut self, open: bool) {
 +        let count = u8::try_from(self.apps.len()).unwrap_or(u8::MAX);
@@ -337,7 +479,7 @@ index 90cead9..a46a1af 100644
          // Display power follows the desktop immediately, even under an active
          // touch: a dark panel must not keep showing controls.
          if self.display_off != state.display_off {
-@@ -898,12 +1107,13 @@ impl RendererSession {
+@@ -898,12 +1132,13 @@ impl RendererSession {
              }
              self.dirty = true;
          }
@@ -357,7 +499,7 @@ index 90cead9..a46a1af 100644
              return Ok(());
          }
          if !self.input.is_idle() {
-@@ -930,17 +1140,50 @@ impl RendererSession {
+@@ -930,17 +1165,50 @@ impl RendererSession {
              self.dimensions.height(),
              capabilities,
          )
@@ -411,7 +553,7 @@ index 90cead9..a46a1af 100644
      fn allocate_request(&mut self, kind: PendingRequest) -> Result<u32, BuiltinRendererError> {
          if self.pending.len() >= MAX_PENDING_REQUESTS {
              return Err(BuiltinRendererError::Protocol);
-@@ -960,6 +1203,233 @@ impl RendererSession {
+@@ -960,6 +1228,233 @@ impl RendererSession {
      }
  }
  
@@ -645,7 +787,7 @@ index 90cead9..a46a1af 100644
  const fn wire_step(direction: StepDirection) -> WireStepDirection {
      match direction {
          StepDirection::Down => WireStepDirection::Down,
-@@ -1230,7 +1700,9 @@ const fn action_key(action: StockAction) -> Option<KeyCode> {
+@@ -1230,7 +1725,9 @@ const fn action_key(action: StockAction) -> Option<KeyCode> {
          | StockAction::StepVolume(_)
          | StockAction::MediaPrevious
          | StockAction::MediaPlayPause
@@ -656,7 +798,7 @@ index 90cead9..a46a1af 100644
      })
  }
  
-@@ -1411,6 +1883,7 @@ mod tests {
+@@ -1411,6 +1908,7 @@ mod tests {
              volume: Some(61),
              muted: true,
              display_off: false,
@@ -664,7 +806,7 @@ index 90cead9..a46a1af 100644
          };
          session
              .set_desktop_state(state)
-@@ -1454,6 +1927,7 @@ mod tests {
+@@ -1454,6 +1952,7 @@ mod tests {
              volume: Some(42),
              muted: false,
              display_off: false,
@@ -672,7 +814,7 @@ index 90cead9..a46a1af 100644
          };
          session
              .set_desktop_state(state)
-@@ -1484,6 +1958,7 @@ mod tests {
+@@ -1484,6 +1983,7 @@ mod tests {
              volume: Some(50),
              muted: false,
              display_off: false,
@@ -680,7 +822,7 @@ index 90cead9..a46a1af 100644
          };
          session
              .set_desktop_state(state)
-@@ -2051,7 +2526,7 @@ mod tests {
+@@ -2051,7 +2551,7 @@ mod tests {
          )
          .unwrap();
          let mut interpreter = InputInterpreter::new(dimensions, stock).unwrap();

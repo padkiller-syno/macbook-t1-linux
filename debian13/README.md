@@ -210,8 +210,9 @@ une seule boucle bash au lieu de 3 services :
 - [`camera/install-webcam-virtuelle.sh`](camera/install-webcam-virtuelle.sh) :
   `v4l2loopback video_nr=10 card_label="FaceTime HD" exclusive_caps=1`.
 - [`camera/facetime-auto`](camera/facetime-auto) + [`.service`](camera/facetime-auto.service)
-  (service **utilisateur**) : au repos ffmpeg pousse du **noir 5 fps** (voyant
-  éteint, ~0 % CPU) ; dès qu'un process lit `/dev/video10` (`fuser`, poll 1 s)
+  (service **utilisateur**) : au repos ffmpeg pousse du **noir 1 fps** (voyant
+  éteint ; `sustain_framerate=1` fait répéter l'image aux lecteurs ; à 5 fps ce
+  noir coûtait ~6 % d'un cœur en permanence, ~1 % à 1 fps, mesuré le 13/11) ; dès qu'un process lit `/dev/video10` (`fuser`, poll 1 s)
   → bascule sur `ffmpeg H.264 → yuyv422 720p30` ; 5 s sans lecteur → retour au
   noir.
 - [`camera/51-masquer-ibridge.conf`](camera/51-masquer-ibridge.conf)
@@ -850,6 +851,14 @@ bash pur, 3 appels par seconde (`wpctl get-volume`, MPRIS, Mutter) et un cache
 de 5 s (`$XDG_RUNTIME_DIR/t1-desktop-provider.cache`) rafraîchi **en
 arrière-plan** (`flock -n … v1 refresh-cache`) pour le lecteur, la sortie, la
 veilleuse et la luminosité auto → ~150 ms en mode économie.
+
+Consommation au repos (13/11/2026) : la boucle du renderer lisait son socket
+en non bloquant toutes les 5 ms (200 réveils/s, ~2,2 % d'un cœur, même sans
+rien à faire). Elle **attend maintenant sur le socket** (`poll`, nouvelle
+fonction `t1_seqpacket_wait_readable` dans le C de t1bridge) : 100 ms au plus
+au repos, 5 ms dès qu'il y a une image à envoyer, un appui ou une répétition,
+un fondu, une jauge qui glisse ou un écran Touch ID. Un appui ou un accusé
+réception réveille la boucle aussitôt. Mesure : 2,2 % → 0,8 % d'un cœur.
 
 ### Panneau d'applications
 

@@ -9,7 +9,8 @@ SRC=; MODE=; idle=0
 t1_cam() { for d in /dev/video[0-9]; do v4l2-ctl -d "$d" --list-formats 2>/dev/null | grep -q H264 && { echo "$d"; return; }; done; }
 stop_src() { [ -n "$SRC" ] && { kill $SRC 2>/dev/null; wait $SRC 2>/dev/null; }; SRC=; MODE=; }
 start_black() {
-  ffmpeg -hide_banner -loglevel error -re -f lavfi -i color=black:s=1280x720:r=5 \
+  # 1 image/s suffit : sustain_framerate=1 fait répéter la dernière image aux lecteurs (5/s coûtait ~6 % d un cœur)
+  ffmpeg -hide_banner -loglevel error -re -f lavfi -i color=black:s=1280x720:r=1 \
          -pix_fmt yuyv422 -f v4l2 $LOOP & SRC=$!; MODE=noir
 }
 start_cam() {

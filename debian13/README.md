@@ -277,6 +277,30 @@ réversible sans reboot** :
 echo auto | sudo tee /sys/class/drm/card*/device/power_dpm_force_performance_level
 ```
 
+### Surveillance et capture des plantages amdgpu (`gpu-watch`)
+
+Gel du 13/11/2026 en jeu (World of Warcraft, Proton experimental, Mesa 25.0.7) :
+`ring gfx timeout` sur `WoW.exe`, échec de la réinitialisation de la partie
+affichage (`REG_WAIT timeout … dce_mi_free_dmif`), puis fautes mémoire
+(`VM_CONTEXT1_PROTECTION_FAULT`, lecture `TC0`) répétées toutes les 2 s. La
+Radeon pilotant l'écran, tout l'affichage se fige, alors que **le noyau tourne
+encore** (90 s ce jour-là, jusqu'à l'arrêt forcé). Profil équilibré, Radeon en
+`high` depuis 7 min : pas de lien avec un changement de niveau DPM.
+
+[`display/gpu-watch`](display/gpu-watch) (service root, installé par
+[`display/install-gpu-watch.sh`](display/install-gpu-watch.sh)) :
+- **chaque seconde**, une ligne CSV `fsync()`ée dans `/var/log/gpu-watch/`
+  (charge, fréquences, puissance, température, VRAM et niveau DPM de la Radeon ;
+  température, fréquence et charge CPU, mémoire, secteur) : elle survit à
+  l'arrêt forcé ; 15 fichiers gardés ;
+- **suit le journal du noyau** : au premier message d'erreur de la carte
+  (`amdgpu 0000:…` + timeout/fault/reset/hang/error/failed, mots entiers :
+  « default » de la ligne de commande noyau déclenchait sinon), sauvegarde dans
+  `incident-<date>/` le **devcoredump** de la carte, les 500 dernières lignes du
+  noyau, les 60 dernières mesures, les processus et les versions (noyau, Mesa,
+  Proton), puis `sync`. Zéro déclenchement sur les démarrages normaux, et le
+  gel du 13/11 aurait été pris dès sa première ligne.
+
 ### Mise à jour : `low` en mode économie d'énergie
 
 Le `high` permanent coûte de la batterie. Comme ce qui gèle la carte est la

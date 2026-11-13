@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""Surveillance Radeon/CPU pour comprendre les gels (MacBookPro13,3, amdgpu Polaris).
+
+- Toutes les secondes : une ligne CSV dans /var/log/gpu-watch/<date>-<boot>.csv (charge, fréquences,
+  puissance et température de la Radeon, VRAM, niveau DPM ; température, fréquence et charge du CPU,
+  mémoire, secteur). Chaque ligne est fsync()ée : elle survit à un gel suivi d'un arrêt forcé.
+- En continu : suit le journal du noyau. À la première erreur amdgpu (ring timeout, GPU fault, reset…),
+  sauvegarde dans /var/log/gpu-watch/incident-<date>/ le devcoredump de la carte, les 500 dernières
+  lignes du noyau, les 60 dernières mesures, les processus, les versions (noyau, Mesa, Proton) puis sync.
+  Lors du gel de WoW du 13/11/2026, le noyau a tourné encore 90 s après le blocage : assez pour tout écrire.
+Lancé par gpu-watch.service (root). Garde les 15 derniers fichiers de mesures.
+"""
+import collections
+import glob
+import os
+import re
+import shutil
+import subprocess
+import threading
+import time
+
+LOG_DIR = "/var/log/gpu-watch"
+KEEP_CSV = 15
+INTERVAL = 1.0
+# messages de la carte elle-même (« amdgpu 0000:01:00.0: … »), mots entiers (« default » ≠ « fault »)
+ERROR_RE = re.compile(r"amdgpu [0-9a-f]{4}:\S+.*\b(timeout|fault|reset|hang|error|failed)\b", re.I)
+DEBOUNCE_S = 60
+
+def read(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+CARD = next((d for d in sorted(glob.glob("/sys/class/drm/card[0-9]"))
+             if os.path.basename(os.path.realpath(d + "/device/driver")) == "amdgpu"), None)
+DEV = CARD + "/device" if CARD else None
+GPU_HWMON = (glob.glob(DEV + "/hwmon/hwmon*") or [None])[0] if DEV else None
+CPU_HWMON = next((h for h in glob.glob("/sys/class/hwmon/hwmon*")
+                  if read(h + "/name") == "coretemp"), None)
+AC = next((p + "/online" for p in glob.glob("/sys/class/power_supply/*")
+           if read(p + "/type") == "Mains"), None)
+
+FIELDS = ["time", "gpu_busy", "gpu_sclk_mhz", "gpu_mclk_mhz", "gpu_w", "gpu_temp", "vram_mb", "gpu_dpm",
+          "cpu_temp", "cpu_mhz", "load1", "mem_avail_mb", "ac"]
+recent = collections.deque(maxlen=60)
+
+
+def num(path, scale=1.0, digits=0):
+    value = read(path)
+    try:
+        return f"{int(value) / scale:.{digits}f}"
+    except ValueError:
+        return ""
+
+
+def sample():
+    cpu_mhz = [float(l.split(":")[1]) for l in read("/proc/cpuinfo").splitlines() if l.startswith("cpu MHz")]
+    mem = dict(l.split(":", 1) for l in read("/proc/meminfo").splitlines() if ":" in l)
+    return {
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "gpu_busy": read(DEV + "/gpu_busy_percent") if DEV else "",
+        "gpu_sclk_mhz": num(GPU_HWMON + "/freq1_input", 1e6) if GPU_HWMON else "",
+        "gpu_mclk_mhz": num(GPU_HWMON + "/freq2_input", 1e6) if GPU_HWMON else "",
+        "gpu_w": num(GPU_HWMON + "/power1_input", 1e6, 1) if GPU_HWMON else "",
+        "gpu_temp": num(GPU_HWMON + "/temp1_input", 1e3) if GPU_HWMON else "",
+        "vram_mb": num(DEV + "/mem_info_vram_used", 2**20) if DEV else "",
+        "gpu_dpm": read(DEV + "/power_dpm_force_performance_level") if DEV else "",
+        "cpu_temp": num(CPU_HWMON + "/temp1_input", 1e3) if CPU_HWMON else "",
+        "cpu_mhz": f"{sum(cpu_mhz) / len(cpu_mhz):.0f}" if cpu_mhz else "",
+        "load1": read("/proc/loadavg").split()[0],
+        "mem_avail_mb": str(int(mem.get("MemAvailable", "0 kB").split()[0]) // 1024),
+        "ac": read(AC) if AC else "",
+    }
+
+
+def durable_write(f, text):
+    f.write(text)
+    f.flush()
+    os.fsync(f.fileno())
+
+
+def run(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"{cmd}: {error}\n"
+
+
+def capture_incident(trigger):
+    """Everything useful about a GPU hang, written and synced while the kernel still runs."""
+    folder = os.path.join(LOG_DIR, "incident-" + time.strftime("%Y%m%d-%H%M%S"))
+    os.makedirs(folder, exist_ok=True)
+
+    def save(name, text):
+        with open(os.path.join(folder, name), "w") as f:
+            durable_write(f, text)
+
+    save("declencheur.txt", trigger + "\n")
+    save("mesures-60s.csv", ",".join(FIELDS) + "\n" + "".join(",".join(r[k] for k in FIELDS) + "\n" for r in recent))
+    save("noyau.txt", run(["journalctl", "-k", "-b", "-n", "500", "--no-pager", "-o", "short-precise"]))
+    save("processus.txt", run(["ps", "-eo", "pid,ppid,etimes,pcpu,pmem,rss,comm,args", "--sort=-pcpu"]))
+    versions = run(["uname", "-a"]) + run(["dpkg-query", "-W", "mesa-vulkan-drivers", "libgl1-mesa-dri",
+                                           "linux-image-amd64", "firmware-amd-graphics"])
+    for pid in run(["pgrep", "-f", "proton|wine|\\.exe"]).split():
+        versions += f"--- {pid}: " + read(f"/proc/{pid}/cmdline").replace("\0", " ")[:400] + "\n"
+    save("versions.txt", versions)
+    if DEV:
+        save("gpu-sysfs.txt", "".join(f"{n}: {read(DEV + '/' + n)}\n" for n in
+                                      ("power_dpm_force_performance_level", "pp_dpm_sclk", "pp_dpm_mclk",
+                                       "gpu_busy_percent", "mem_info_vram_used")))
+        dump = DEV + "/devcoredump/data"
+        if os.path.exists(dump):
+            try:
+                shutil.copyfile(dump, os.path.join(folder, "devcoredump.bin"))
+            except OSError as error:
+                save("devcoredump-erreur.txt", str(error))
+    os.sync()
+
+
+def watch_kernel():
+    last = 0.0
+    proc = subprocess.Popen(["journalctl", "-k", "-f", "-n", "0", "-o", "short-precise"],
+                            stdout=subprocess.PIPE, text=True)
+    for line in proc.stdout:
+        if ERROR_RE.search(line) and time.time() - last > DEBOUNCE_S:
+            last = time.time()
+            try:
+                capture_incident(line.strip())
+            except Exception as error:  # never let the watcher die during an incident
+                print(f"gpu-watch: capture échouée : {error}", flush=True)
+
+
+def main():
+    os.makedirs(LOG_DIR, exist_ok=True)
+    for old in sorted(glob.glob(LOG_DIR + "/*.csv"))[:-KEEP_CSV]:
+        os.remove(old)
+    boot = read("/proc/sys/kernel/random/boot_id")[:8]
+    path = os.path.join(LOG_DIR, time.strftime("%Y%m%d-%H%M%S") + f"-{boot}.csv")
+    threading.Thread(target=watch_kernel, daemon=True).start()
+    with open(path, "a") as f:
+        durable_write(f, ",".join(FIELDS) + "\n")
+        while True:
+            row = sample()
+            recent.append(row)
+            durable_write(f, ",".join(row[k] for k in FIELDS) + "\n")
+            time.sleep(INTERVAL)
+
+
+if __name__ == "__main__":
+    main()

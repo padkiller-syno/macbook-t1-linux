@@ -29,7 +29,7 @@ GNOME 48 / **Wayland**, LUKS + LVM. Session de remise en état du 20/10/2026.
 | **Modules T1 sous DKMS** | ✅ reconstruits à chaque nouveau kernel | [`dkms/`](#après-une-mise-à-jour-du-kernel--dkms) |
 | **Thunderbolt 3 : USB 3 des écrans** (Ethernet) | ✅ runtime PM désactivé sur les contrôleurs USB 3 Alpine Ridge | [ici](#thunderbolt-3--usb-3-des-écrans--docks-perdu-ethernet-etc) |
 | **Écran de démarrage** (LUKS) | ✅ pomme blanche sur fond noir, saisie façon macOS (Plymouth) | [`demarrage/`](#écran-de-démarrage--pomme--plymouth) |
-| Veille / hibernation | ❌ impossible : la Radeon Polaris ne se réveille pas → **interdites** au niveau système | [`veille/`](#veille-et-hibernation--impossibles-amdgpu) |
+| Veille S3 | ✅ depuis le 16/11/2026 (amdgpu patché) : écran, Thunderbolt, Wi-Fi, Touch Bar et Touch ID reviennent ; hibernation toujours interdite | [`veille/`](#veille-et-hibernation) |
 
 ---
 
@@ -687,11 +687,16 @@ Non établi : si la veille a **provoqué** la coupure de +89 s ou l'a seulement
 suivie ; en pratique, l'empêcher suffit. Coût énergétique négligeable.
 À vérifier après un reboot : Ethernet toujours connecté au-delà de 2 min.
 
-## Veille et hibernation — impossibles (amdgpu)
+## Veille et hibernation
 
-**Verdict : ni la veille ni l'hibernation ne fonctionnent** sur ce Mac sous
+**Mise à jour du 16/11/2026 : la veille S3 fonctionne**, avec le pilote amdgpu
+patché et le hook de [`veille/install-veille.sh`](veille/install-veille.sh)
+(détails dans [`veille/README.md`](veille/README.md)). L'hibernation reste
+interdite (jamais testée). La suite de cette section est l'historique.
+
+**Verdict d'origine : ni la veille ni l'hibernation ne fonctionnaient** sur ce Mac sous
 Linux 6.12, à cause de la reprise de la **Radeon Polaris** (qui pilote l'eDP).
-La T1, le Wi-Fi, le son et le clavier, eux, reviennent bien.
+La T1, le Wi-Fi, le son et le clavier, eux, revenaient bien.
 
 ### Monitoring
 

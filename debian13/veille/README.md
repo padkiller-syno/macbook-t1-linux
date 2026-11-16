@@ -10,6 +10,8 @@
 - règle udev `90-macbook-pas-de-d3cold.rules` : aucun périphérique PCI en D3cold (sinon gel à l'endormissement) ;
 - `system-sleep/veille-macbook` : Thunderbolt éteint/rallumé, T1 prévenue par le SMC (`SOCW`) et Touch Bar
   « dégarée », rechargement de brcmfmac au réveil (Wi-Fi) ;
+- son : `/lib/firmware/hda-macbook13-3.patch` + `/etc/modprobe.d/veille-macbook-son.conf` (option `patch=` de
+  snd-hda-intel) et `son-recharger.sh`, lancé 3 s après le réveil (unité `veille-son`) ;
 - `veille-garde.service` : bloque la veille (`systemd-inhibit`) si le module amdgpu patché n'est pas chargé ;
 - `logind.conf.d/10-capot-verrouille.conf` : capot = veille sur batterie, verrouillage sur secteur, rien si écran externe.
 
@@ -46,10 +48,36 @@ carte au démarrage, la VRAM passe à `0xF400000000`, et le réveil comme les re
 | Élément | État |
 |---|---|
 | Radeon, session, écrans externes, souris | OK |
-| Wi-Fi (BCM43602) | ne s'associe plus ; OK après `reparer-reveil.sh wifi` (reload brcmfmac) |
+| Wi-Fi (BCM43602) | 2,4 GHz OK ; **5 GHz refusé jusqu'au redémarrage**, voir « Wi-Fi 5 GHz » ci-dessous |
+| Son, micros | **OK** depuis le 16/11 (`son-recharger.sh`), voir « Son » ci-dessous |
 | Touch Bar, Touch ID | **OK** depuis le 16/11 (hook : `SOCW` + rapport 3 = `02 f4 01`), voir « Touch Bar » ci-dessous |
 | Thunderbolt (USB 3, réseau du dock) | **OK** depuis le 16/11 (hook : SXFP avant, TRPE + rescan après, 14/14, écrans et réseau du dock OK) ; sauf le côté où un chargeur est branché pendant la veille |
 | Mode 1 (D3cold permis) | gel pendant l'endormissement, sans journal |
+
+## Son : résolu le 16/11 (`son-recharger.sh` + `hda-macbook13-3.patch`)
+
+- **Symptôme** : après S3, plus de son ni de micro (PipeWire en lecture, rien ne sort ; capture figée).
+- **Cause** : le pilote `snd_hda_macbookpro` ne configure les puces voisines du CS8409 (amplis MAX98706, CS42L83,
+  micros, en I2C) qu'au démarrage du codec (`cs_8409_apple_boot_init`) ; son `resume` ne le refait pas. Et un
+  codec remis à zéro perd ce que l'EFI y a écrit : identifiant Apple `0x106b3900` et broches → « UNKNOWN
+  subsystem id », probe en `-22`, pilote générique sans sorties.
+- **Correctif** : `hda-macbook13-3.patch` (identifiant + 34 broches relevées après démarrage, appliqué à chaque
+  détection par l'option `patch=` de snd-hda-intel) ; au réveil, `son-recharger.sh` détache le seul contrôleur
+  `00:1f.3`, recharge `snd_hda_codec_cs8409` et le rattache, **3 s après, hors du hook** (`systemd-run`).
+- **Pièges** : détacher aussi le HDMI de la Radeon (`01:00.1`) juste après le réveil a figé la machine (écran
+  noir) ; snd_hda_intel ne réutilise pas les numéros de carte (32 max par chargement) → ~30 veilles par démarrage.
+
+## Wi-Fi 5 GHz : non résolu (16/11)
+
+- Après S3, la Freebox 5 GHz est refusée (`ASSOC-REJECT status 16`, bssid = dernier point d'accès utilisé) ;
+  le 2,4 GHz passe ; seul un redémarrage répare.
+- Cause 1 (contournée) : une borne voisine du même réseau annonçait le pays GB → canal DFS 116 en « No IR ».
+- Cause 2 : la puce n'est **jamais mise hors tension sous Linux** : DSDT `RP01.APPD/APPU`, `DPWR` (`EC.APWC`)
+  et `DRST` (GPIO `0x01000012`) ne font rien hors macOS (`If (!OSDW ())`). Elle garde son état : sans effet =
+  rechargement de brcmfmac (ou déchargement avant veille, hook actuel), reset PCI, `feature_disable=0x82000`,
+  rechargement de cfg80211, redémarrage de wpa_supplicant/NetworkManager.
+- À essayer : couper l'alimentation comme macOS (`APWC` = bit 3 du registre EC `0x03`, via `ec_sys`).
+- Outils : `wifi-photo.sh` (photo de l'état), `test-wifi-reset.sh`, `test-wifi-apres-veille.sh`.
 
 ## Thunderbolt : résolu le 16/11 (`tb-go2sx.sh`, intégré au hook)
 

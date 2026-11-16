@@ -4,6 +4,8 @@
 # niveaux affichés par les jauges de la Touch Bar (plus de bulle GNOME depuis le 10/11).
 # Pages volume / éclairage (16/11) : curseurs (luminosité et clavier via gsd-power), micro, sortie
 # par défaut, EasyEffects, luminosité auto, veilleuse. Les infos système sont lues par le renderer.
+# Depuis le 16/11 au soir, le renderer lit lui-même l'état (native_status.rs) : `status` ne sert plus
+# qu'en secours (T1BRIDGE_NATIVE_STATUS=0, ou PipeWire / D-Bus indisponibles) ; restent les actions.
 # Appelé par t1-touchbar avec : v1 <opération> [argument]   (délai max 500 ms)
 # `status` tourne chaque seconde : analyse en bash pur (en mode économie, chaque processus
 # lancé coûte 30-60 ms) et cache de 5 s pour ce qui change rarement.
@@ -48,9 +50,9 @@ refresh_cache() {  # valeurs lentes : lecteur, sortie, veilleuse, luminosité au
     *) [[ $(amixer -c PCH cget iface=CARD,name='Headphone Jack' 2>/dev/null) == *': values=on'* ]] && { out=1; sink=hp; } ;;
   esac
   m=$(wpctl get-volume @DEFAULT_AUDIO_SOURCE@ 2>/dev/null) && { mic=0; [[ $m == *MUTED* ]] && mic=1; }
-  # EasyEffects : « 1 » = contourné (effets coupés) ; absent = pas de champ
+  # EasyEffects : clé « bypass » (13 ms, contre 170 ms pour « easyeffects -b 3 ») ; absent = pas de champ
   if pgrep -x easyeffects >/dev/null; then
-    case "$(easyeffects -b 3 2>/dev/null | tail -1)" in 1) fx=0 ;; 0) fx=1 ;; esac
+    case "$(gsettings get com.github.wwmm.easyeffects bypass 2>/dev/null)" in true) fx=0 ;; false) fx=1 ;; esac
   fi
   nl=$(busctl --user get-property org.gnome.SettingsDaemon.Color /org/gnome/SettingsDaemon/Color \
        org.gnome.SettingsDaemon.Color NightLightActive 2>/dev/null)
@@ -154,7 +156,7 @@ case "${2:-}" in
   toggle-mic)        wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle; refresh_soon ;;
   cycle-output)      cycle_output; refresh_soon ;;
   toggle-effects)
-    if [ "$(easyeffects -b 3 2>/dev/null | tail -1)" = 1 ]; then easyeffects -b 2; else easyeffects -b 1; fi
+    if [ "$(gsettings get com.github.wwmm.easyeffects bypass 2>/dev/null)" = true ]; then easyeffects -b 2; else easyeffects -b 1; fi
     refresh_soon ;;
   toggle-auto-brightness) toggle_gsetting org.gnome.settings-daemon.plugins.power ambient-enabled; refresh_soon ;;
   toggle-night-light)     toggle_gsetting org.gnome.settings-daemon.plugins.color night-light-enabled; refresh_soon ;;

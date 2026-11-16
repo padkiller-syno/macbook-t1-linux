@@ -21,7 +21,7 @@ if [ "${1:-}" = annuler ]; then
 fi
 
 [ -x "$SRC" ] || { echo "binaire absent : cargo build --release -p t1-touchbar dans ~/git/t1/t1bridge"; exit 1; }
-sudo sh -c "cp -p '$BIN' '$BIN.bak-$DATE' && install -m 755 '$SRC' '$BIN'"
+sudo sh -c "cp -p '$BIN' '$BIN.bak-$DATE' && install -s -m 755 '$SRC' '$BIN'"
 cp -p "$PROV" "$PROV.bak-$DATE"
 install -m 755 "$ICI/desktop-provider/t1-desktop-provider" "$PROV"
 systemctl --user restart t1-touchbar.service

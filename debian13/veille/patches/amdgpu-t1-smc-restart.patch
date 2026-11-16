@@ -1,0 +1,164 @@
+diff --git a/amdgpu/amdgpu_device.c b/amdgpu/amdgpu_device.c
+index ea9a6ed..04b541f 100644
+--- a/amdgpu/amdgpu_device.c
++++ b/amdgpu/amdgpu_device.c
+@@ -4783,10 +4783,19 @@ int amdgpu_device_resume(struct drm_device *dev, bool notify_clients)
+ 		amdgpu_dpm_gfx_state_change(adev, sGpuChangeState_D0Entry);
+ 
+ 	/* post card */
+-	if (amdgpu_device_need_post(adev)) {
+-		r = amdgpu_device_asic_init(adev);
+-		if (r)
+-			dev_err(adev->dev, "amdgpu asic init failed\n");
++	{
++		/* t1 : trace de l'état de la carte au réveil (MacBookPro13,3) */
++		u32 t1_s7 = adev->bios_scratch_reg_offset ? RREG32(adev->bios_scratch_reg_offset + 7) : 0;
++		bool t1_post = amdgpu_device_need_post(adev);
++
++		dev_info(adev->dev, "amdgpu-t1: resume need_post=%d bios_scratch7=0x%08x memsize=0x%08x in_s0ix=%d in_s3=%d\n",
++			 t1_post, t1_s7, amdgpu_asic_get_config_memsize(adev), adev->in_s0ix, adev->in_s3);
++		if (t1_post) {
++			r = amdgpu_device_asic_init(adev);
++			dev_info(adev->dev, "amdgpu-t1: asic_init -> %d\n", r);
++			if (r)
++				dev_err(adev->dev, "amdgpu asic init failed\n");
++		}
+ 	}
+ 
+ 	r = amdgpu_device_ip_resume(adev);
+diff --git a/amdgpu/vi.c b/amdgpu/vi.c
+index fcc93c7..72e496f 100644
+--- a/amdgpu/vi.c
++++ b/amdgpu/vi.c
+@@ -1418,6 +1418,7 @@ static const struct vi_reset_quirk vi_reset_quirks[] = {
+ 	{ 0x67ef, PCI_VENDOR_ID_APPLE, 0x0190, 0xe3 }, /* Radeon Pro 555X */
+ 	{ 0x67ef, PCI_VENDOR_ID_APPLE, 0x018f, 0xc2 }, /* Radeon Pro 560X */
+ 	{ 0x67ef, PCI_VENDOR_ID_APPLE, 0x017a, 0xc7 }, /* Radeon Pro 555 */
++	{ 0x67ef, PCI_VENDOR_ID_APPLE, 0x0166, 0xc7 }, /* t1 : Radeon Pro 455/460, MacBookPro13,3 */
+ };
+ 
+ static bool vi_need_reset_on_init(struct amdgpu_device *adev)
+diff --git a/pm/powerplay/smumgr/polaris10_smumgr.c b/pm/powerplay/smumgr/polaris10_smumgr.c
+index e59b872..ddbf404 100644
+--- a/pm/powerplay/smumgr/polaris10_smumgr.c
++++ b/pm/powerplay/smumgr/polaris10_smumgr.c
+@@ -289,13 +289,59 @@ static int polaris10_start_smu_in_non_protection_mode(struct pp_hwmgr *hwmgr)
+ 	return result;
+ }
+ 
++/*
++ * t1 (MacBookPro13,3) : après une coupure d'alimentation par le firmware Apple (veille S3) ou un
++ * reset PCI, le SMC peut sembler « en marche » alors qu'il ne répond plus au chargement des
++ * microcodes (UcodeLoadStatus reste à 0). amdgpu.t1_smc_restart=1 : en cas d'échec, remettre le
++ * SMC à zéro, recharger son firmware et réessayer une fois.
++ */
++static int t1_smc_restart = 1;
++module_param(t1_smc_restart, int, 0644);
++MODULE_PARM_DESC(t1_smc_restart, "t1: force SMC restart when ucode loading fails (Polaris, 1 = on)");
++
++static void t1_smc_state(struct pp_hwmgr *hwmgr, const char *when)
++{
++	pr_info("amdgpu-t1: %s: smc_running=%d pc=0x%08x ck_disable=%u smu_firmware=0x%08x rcu_uc_events=0x%08x firmware_flags=0x%08x smu_status=0x%08x\n",
++		when, smu7_is_smc_ram_running(hwmgr),
++		cgs_read_ind_register(hwmgr->device, CGS_IND_REG__SMC, ixSMC_PC_C),
++		PHM_READ_VFPF_INDIRECT_FIELD(hwmgr->device, CGS_IND_REG__SMC, SMC_SYSCON_CLOCK_CNTL_0, ck_disable),
++		cgs_read_ind_register(hwmgr->device, CGS_IND_REG__SMC, ixSMU_FIRMWARE),
++		cgs_read_ind_register(hwmgr->device, CGS_IND_REG__SMC, ixRCU_UC_EVENTS),
++		cgs_read_ind_register(hwmgr->device, CGS_IND_REG__SMC, ixFIRMWARE_FLAGS),
++		cgs_read_ind_register(hwmgr->device, CGS_IND_REG__SMC, ixSMU_STATUS));
++}
++
++static int t1_polaris10_boot_smc(struct pp_hwmgr *hwmgr)
++{
++	struct polaris10_smumgr *smu_data = (struct polaris10_smumgr *)(hwmgr->smu_backend);
++	int result;
++
++	smu_data->protected_mode = (uint8_t) (PHM_READ_VFPF_INDIRECT_FIELD(hwmgr->device, CGS_IND_REG__SMC, SMU_FIRMWARE, SMU_MODE));
++	smu_data->smu7_data.security_hard_key = (uint8_t) (PHM_READ_VFPF_INDIRECT_FIELD(hwmgr->device, CGS_IND_REG__SMC, SMU_FIRMWARE, SMU_SEL));
++	pr_info("amdgpu-t1: boot SMC, protected_mode=%u\n", smu_data->protected_mode);
++
++	if (smu_data->protected_mode == 0)
++		result = polaris10_start_smu_in_non_protection_mode(hwmgr);
++	else
++		result = polaris10_start_smu_in_protection_mode(hwmgr);
++	if (result)
++		return result;
++
++	polaris10_avfs_event_mgr(hwmgr);
++	return 0;
++}
++
+ static int polaris10_start_smu(struct pp_hwmgr *hwmgr)
+ {
+ 	int result = 0;
+ 	struct polaris10_smumgr *smu_data = (struct polaris10_smumgr *)(hwmgr->smu_backend);
++	bool booted = false;
++
++	t1_smc_state(hwmgr, "start_smu");
+ 
+ 	/* Only start SMC if SMC RAM is not running */
+ 	if (!smu7_is_smc_ram_running(hwmgr) && hwmgr->not_vf) {
++		booted = true;
+ 		smu_data->protected_mode = (uint8_t) (PHM_READ_VFPF_INDIRECT_FIELD(hwmgr->device, CGS_IND_REG__SMC, SMU_FIRMWARE, SMU_MODE));
+ 		smu_data->smu7_data.security_hard_key = (uint8_t) (PHM_READ_VFPF_INDIRECT_FIELD(hwmgr->device, CGS_IND_REG__SMC, SMU_FIRMWARE, SMU_SEL));
+ 
+@@ -309,6 +355,7 @@ static int polaris10_start_smu(struct pp_hwmgr *hwmgr)
+ 			PP_ASSERT_WITH_CODE(0, "Failed to load SMU ucode.", return result);
+ 
+ 		polaris10_avfs_event_mgr(hwmgr);
++		t1_smc_state(hwmgr, "after SMC boot");
+ 	}
+ 
+ 	/* Setup SoftRegsStart here for register lookup in case DummyBackEnd is used and ProcessFirmwareHeader is not executed */
+@@ -316,7 +363,23 @@ static int polaris10_start_smu(struct pp_hwmgr *hwmgr)
+ 					&(smu_data->smu7_data.soft_regs_start), 0x40000);
+ 
+ 	result = smu7_request_smu_load_fw(hwmgr);
++	if (!result || !t1_smc_restart || !hwmgr->not_vf)
++		return result;
+ 
++	/* t1 : SMC muet, on le redémarre de force (même si on vient de le démarrer) puis on réessaie */
++	t1_smc_state(hwmgr, booted ? "ucode load failed after SMC boot" : "ucode load failed, SMC was running");
++	PHM_WRITE_VFPF_INDIRECT_FIELD(hwmgr->device, CGS_IND_REG__SMC, SMC_SYSCON_RESET_CNTL, rst_reg, 1);
++	PHM_WRITE_VFPF_INDIRECT_FIELD(hwmgr->device, CGS_IND_REG__SMC, SMC_SYSCON_CLOCK_CNTL_0, ck_disable, 1);
++	result = t1_polaris10_boot_smc(hwmgr);
++	t1_smc_state(hwmgr, "after forced SMC restart");
++	if (result) {
++		pr_err("amdgpu-t1: forced SMC restart failed (%d)\n", result);
++		return result;
++	}
++	smu7_read_smc_sram_dword(hwmgr, SMU7_FIRMWARE_HEADER_LOCATION + offsetof(SMU74_Firmware_Header, SoftRegisters),
++					&(smu_data->smu7_data.soft_regs_start), 0x40000);
++	result = smu7_request_smu_load_fw(hwmgr);
++	pr_info("amdgpu-t1: ucode load retry after SMC restart: %s (%d)\n", result ? "FAILED" : "OK", result);
+ 	return result;
+ }
+ 
+diff --git a/pm/powerplay/smumgr/smu7_smumgr.c b/pm/powerplay/smumgr/smu7_smumgr.c
+index 3e0068a..7c96772 100644
+--- a/pm/powerplay/smumgr/smu7_smumgr.c
++++ b/pm/powerplay/smumgr/smu7_smumgr.c
+@@ -386,10 +386,22 @@ int smu7_request_smu_load_fw(struct pp_hwmgr *hwmgr)
+ 	smum_send_msg_to_smc_with_parameter(hwmgr, PPSMC_MSG_LoadUcodes, fw_to_load, NULL);
+ 
+ 	r = smu7_check_fw_load_finish(hwmgr, fw_to_load);
+-	if (!r)
++	if (!r) {
++		pr_info("amdgpu-t1: ucode load OK, header_buffer mc=0x%llx smu_buffer mc=0x%llx fw_buf mc=0x%llx vram_start=0x%llx\n",
++			smu_data->header_buffer.mc_addr, smu_data->smu_buffer.mc_addr,
++			((struct amdgpu_device *)hwmgr->adev)->firmware.fw_buf_mc, ((struct amdgpu_device *)hwmgr->adev)->gmc.vram_start);
+ 		return 0;
++	}
+ 
+ 	pr_err("SMU load firmware failed\n");
++	pr_err("amdgpu-t1: UcodeLoadStatus=0x%08x wanted=0x%08x soft_regs_start=0x%08x\n",
++	       cgs_read_ind_register(hwmgr->device, CGS_IND_REG__SMC,
++				     smu_data->soft_regs_start + smum_get_offsetof(hwmgr,
++				     SMU_SoftRegisters, UcodeLoadStatus)),
++	       fw_to_load, smu_data->soft_regs_start);
++	pr_err("amdgpu-t1: header_buffer mc=0x%llx smu_buffer mc=0x%llx fw_buf mc=0x%llx vram_start=0x%llx gart_start=0x%llx\n",
++	       smu_data->header_buffer.mc_addr, smu_data->smu_buffer.mc_addr,
++	       ((struct amdgpu_device *)hwmgr->adev)->firmware.fw_buf_mc, ((struct amdgpu_device *)hwmgr->adev)->gmc.vram_start, ((struct amdgpu_device *)hwmgr->adev)->gmc.gart_start);
+ 
+ failed:
+ 	kfree(smu_data->toc);

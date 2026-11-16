@@ -2,6 +2,8 @@
 # Fournisseur bureau t1bridge (contrat « Desktop provider v1 ») pour GNOME + PipeWire.
 # Touch Bar : volume / sourdine (wpctl), média (MPRIS), extinction avec l'écran (Mutter),
 # niveaux affichés par les jauges de la Touch Bar (plus de bulle GNOME depuis le 10/11).
+# Pages volume / éclairage (16/11) : curseurs (luminosité et clavier via gsd-power), micro, sortie
+# par défaut, EasyEffects, luminosité auto, veilleuse. Les infos système sont lues par le renderer.
 # Appelé par t1-touchbar avec : v1 <opération> [argument]   (délai max 500 ms)
 # `status` tourne chaque seconde : analyse en bash pur (en mode économie, chaque processus
 # lancé coûte 30-60 ms) et cache de 5 s pour ce qui change rarement.
@@ -37,27 +39,37 @@ sync_gnome_brightness() {  # la Touch Bar règle l'écran via logind, sans passe
     org.gnome.SettingsDaemon.Power.Screen Brightness i "$PCT" >/dev/null 2>&1 || true
 }
 
-refresh_cache() {  # valeurs lentes : lecteur MPRIS, sortie externe, veilleuse, luminosité auto
-  local out=0 night=- auto=1 nl
-  [[ $(wpctl inspect $SINK 2>/dev/null) == *'node.name = "bluez_output'* ]] && out=1
-  [ $out = 0 ] && [[ $(amixer -c PCH cget iface=CARD,name='Headphone Jack' 2>/dev/null) == *': values=on'* ]] && out=1
+refresh_cache() {  # valeurs lentes : lecteur, sortie, veilleuse, luminosité auto, micro, effets
+  local out=0 night=- auto=1 nl sink=sp mic=- fx=- inspect m
+  inspect=$(wpctl inspect $SINK 2>/dev/null)
+  case "$inspect" in
+    *'node.name = "bluez_output'*) out=1; sink=bt ;;
+    *'node.name = "alsa_output.usb'*) out=1; sink=usb ;;
+    *) [[ $(amixer -c PCH cget iface=CARD,name='Headphone Jack' 2>/dev/null) == *': values=on'* ]] && { out=1; sink=hp; } ;;
+  esac
+  m=$(wpctl get-volume @DEFAULT_AUDIO_SOURCE@ 2>/dev/null) && { mic=0; [[ $m == *MUTED* ]] && mic=1; }
+  # EasyEffects : « 1 » = contourné (effets coupés) ; absent = pas de champ
+  if pgrep -x easyeffects >/dev/null; then
+    case "$(easyeffects -b 3 2>/dev/null | tail -1)" in 1) fx=0 ;; 0) fx=1 ;; esac
+  fi
   nl=$(busctl --user get-property org.gnome.SettingsDaemon.Color /org/gnome/SettingsDaemon/Color \
        org.gnome.SettingsDaemon.Color NightLightActive 2>/dev/null)
   case "$nl" in "b true") night=1 ;; "b false") night=0 ;; esac
   # clé absente = valeur par défaut (activée)
   [ "$(dconf read /org/gnome/settings-daemon/plugins/power/ambient-enabled 2>/dev/null)" = false ] && auto=0
-  printf '%s\n' "$EPOCHSECONDS" "$(player)" "$out" "$night" "$auto" >"$CACHE.$$" && mv -f "$CACHE.$$" "$CACHE"
+  printf '%s\n' "$EPOCHSECONDS" "$(player)" "$out" "$night" "$auto" "$sink" "$mic" "$fx" >"$CACHE.$$" && mv -f "$CACHE.$$" "$CACHE"
 }
 
 status() {
   local caps=$((1 + 8 + 16)) display=1   # 1 audio, 8 retour de niveau, 16 écran
-  local v num int frac vol muted=0 extras="" ts=0 p="" out=0 night=- auto=1 mp psm
+  local v num int frac vol muted=0 extras="" ts=0 p="" out=0 night=- auto=1 sink=sp mic=- fx=- mp psm
   v=$(wpctl get-volume $SINK 2>/dev/null) || exit 1   # « Volume: 0.23 [MUTED] »
   num=${v#Volume: }; num=${num%% *}; int=${num%%.*}; frac=${num#*.}00; frac=${frac:0:2}
   vol=$(( 10#$int * 100 + 10#$frac )); [ $vol -gt 100 ] && vol=100
   [[ $v == *MUTED* ]] && muted=1
 
-  [ -r "$CACHE" ] && { read -r ts; read -r p; read -r out; read -r night; read -r auto; } <"$CACHE"
+  [ -r "$CACHE" ] && { read -r ts; read -r p; read -r out; read -r night; read -r auto
+                       read -r sink; read -r mic; read -r fx; } <"$CACHE"
   # rafraîchi en arrière-plan (~0,5 s en mode économie, au-delà du délai de 500 ms) :
   # cet appel répond avec les valeurs du cache, même périmées ; flock évite les doublons.
   if [ $(( EPOCHSECONDS - ts )) -ge $CACHE_TTL ]; then
@@ -80,7 +92,9 @@ status() {
       rm -f "$CACHE"   # lecteur fermé : relire la liste au prochain appel
     fi
   fi
-  extras+=" out=$out auto=$auto"
+  extras+=" out=$out auto=$auto sink=${sink:-sp}"
+  [ "${mic:--}" != - ] && extras+=" mic=$mic"
+  [ "${fx:--}" != - ] && extras+=" fx=$fx"
   [ "$night" != - ] && extras+=" night=$night"
   percent /sys/class/backlight/gmux_backlight; [ -n "$PCT" ] && extras+=" disp=$PCT"
   percent /sys/class/leds/spi::kbd_backlight; [ -n "$PCT" ] && extras+=" kbd=$PCT"
@@ -89,6 +103,33 @@ status() {
         org.gnome.Mutter.DisplayConfig PowerSaveMode 2>/dev/null)
   [ -n "$psm" ] && [ "${psm#i }" != 0 ] && display=0
   echo "T1BRIDGE-DESKTOP 1 $caps $vol $muted $display$extras"
+}
+
+refresh_soon() {  # après une bascule : cache relu tout de suite, en arrière-plan (délai de 500 ms)
+  flock -n "$CACHE.lock" "$0" v1 refresh-cache </dev/null >/dev/null 2>&1 &
+}
+
+gsd_power() {  # gsd_power <Screen|Keyboard> <pourcentage> : passe par GNOME (luminosité auto cohérente)
+  busctl --user set-property org.gnome.SettingsDaemon.Power /org/gnome/SettingsDaemon/Power \
+    "org.gnome.SettingsDaemon.Power.$1" Brightness i "$2" >/dev/null
+}
+
+toggle_gsetting() {  # toggle_gsetting <schéma> <clé>
+  if [ "$(gsettings get "$1" "$2")" = true ]; then gsettings set "$1" "$2" false
+  else gsettings set "$1" "$2" true; fi
+}
+
+cycle_output() {  # sortie suivante parmi les sorties matérielles (EasyEffects exclu)
+  local ids=() current="" line
+  while IFS= read -r line; do
+    [[ $line =~ ^[^0-9*]*(\*)?[[:space:]]+([0-9]+)\.\ (.*)$ ]] || continue
+    [[ ${BASH_REMATCH[3]} == *"Easy Effects"* ]] && continue
+    ids+=("${BASH_REMATCH[2]}"); [ -n "${BASH_REMATCH[1]}" ] && current=${BASH_REMATCH[2]}
+  done < <(wpctl status 2>/dev/null | sed -n '/^Audio/,/^Video/p' | sed -n '/Sinks:/,/Sources:/p')
+  [ ${#ids[@]} -gt 1 ] || return 0
+  local i next=${ids[0]}
+  for i in "${!ids[@]}"; do [ "${ids[$i]}" = "$current" ] && next=${ids[$(( (i + 1) % ${#ids[@]} ))]}; done
+  wpctl set-default "$next"
 }
 
 [ "${1:-}" = v1 ] || exit 2
@@ -104,6 +145,19 @@ case "${2:-}" in
   media-previous)    mpris Previous ;;
   media-play-pause)  mpris PlayPause ;;
   media-next)        mpris Next ;;
+  set-display-brightness)
+    [[ ${3:-} =~ ^[0-9]+$ ]] && [ "$3" -le 100 ] || exit 2
+    gsd_power Screen "$3" ;;
+  set-keyboard-backlight)
+    [[ ${3:-} =~ ^[0-9]+$ ]] && [ "$3" -le 100 ] || exit 2
+    gsd_power Keyboard "$3" ;;
+  toggle-mic)        wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle; refresh_soon ;;
+  cycle-output)      cycle_output; refresh_soon ;;
+  toggle-effects)
+    if [ "$(easyeffects -b 3 2>/dev/null | tail -1)" = 1 ]; then easyeffects -b 2; else easyeffects -b 1; fi
+    refresh_soon ;;
+  toggle-auto-brightness) toggle_gsetting org.gnome.settings-daemon.plugins.power ambient-enabled; refresh_soon ;;
+  toggle-night-light)     toggle_gsetting org.gnome.settings-daemon.plugins.color night-light-enabled; refresh_soon ;;
   launch-app)   # N = rang dans le panneau ; l'id vient du cache écrit par t1-touchbar-apps (icône et lanceur alignés)
     [[ ${3:-} =~ ^[0-9]+$ ]] || exit 2
     read -r app <"${XDG_CACHE_HOME:-$HOME/.cache}/t1bridge/apps/$3.id" 2>/dev/null || exit 1

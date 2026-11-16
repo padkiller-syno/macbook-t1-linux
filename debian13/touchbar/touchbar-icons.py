@@ -144,7 +144,49 @@ icons["APPS"] = apps_grid(24)
 icons["CLOSE"] = close_cross(24)
 icons["PLAY"] = svg_mask("actions/media-playback-start-symbolic.svg", ICON)
 icons["PAUSE"] = svg_mask("actions/media-playback-pause-symbolic.svg", ICON)
-labels = {"ESC": text_mask("esc", 20)}
+
+
+def equalizer(size):
+    # trois curseurs verticaux : réglages du son (EasyEffects)
+    def p(ctx):
+        ctx.set_line_width(2.2)
+        ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+        for i, knob in enumerate((0.62, 0.32, 0.52)):
+            x = size * (0.22 + 0.28 * i)
+            ctx.move_to(x, size * 0.12); ctx.line_to(x, size * 0.88); ctx.stroke()
+            ctx.arc(x, size * knob, size * 0.11, 0, 2 * math.pi); ctx.fill()
+    return drawn(size, size, p)
+
+
+def chip(size):
+    # processeur : carré et ses broches
+    def p(ctx):
+        a, b = size * 0.24, size * 0.76
+        ctx.set_line_width(2.2)
+        ctx.rectangle(a, a, b - a, b - a); ctx.stroke()
+        ctx.rectangle(size * 0.4, size * 0.4, size * 0.2, size * 0.2); ctx.fill()
+        ctx.set_line_width(1.8)
+        for t in (0.38, 0.5, 0.62):
+            for (x1, y1, x2, y2) in ((t, 0.08, t, 0.24), (t, 0.76, t, 0.92), (0.08, t, 0.24, t), (0.76, t, 0.92, t)):
+                ctx.move_to(size * x1, size * y1); ctx.line_to(size * x2, size * y2)
+        ctx.stroke()
+    return drawn(size, size, p)
+
+
+# icônes des pages volume, éclairage et système (16/11)
+icons["MIC"] = svg_mask("devices/audio-input-microphone-symbolic.svg", ICON)
+icons["MIC_OFF"] = svg_mask("status/microphone-disabled-symbolic.svg", ICON)
+icons["SPEAKERS"] = svg_mask("devices/audio-speakers-symbolic.svg", ICON)
+icons["HEADPHONES"] = svg_mask("devices/audio-headphones-symbolic.svg", ICON)
+icons["BLUETOOTH"] = svg_mask("devices/bluetooth-symbolic.svg", ICON)
+icons["NIGHT"] = svg_mask("status/weather-clear-night-symbolic.svg", ICON)
+icons["KEYBOARD"] = svg_mask("devices/input-keyboard-symbolic.svg", ICON)
+icons["EFFECTS"] = equalizer(ICON)
+icons["CPU"] = chip(ICON)
+icons["BATTERY"] = svg_mask("legacy/battery-full-charging-symbolic.svg", ICON)
+EXTRA = ["PLAY", "PAUSE", "APPS", "CLOSE", "MIC", "MIC_OFF", "SPEAKERS", "HEADPHONES", "BLUETOOTH",
+         "NIGHT", "KEYBOARD", "EFFECTS", "CPU", "BATTERY"]
+labels ={"ESC": text_mask("esc", 20)}
 for i in range(1, 13):
     labels[f"F{i}"] = text_mask(f"F{i}", 20)
 
@@ -248,7 +290,7 @@ def emit_icons(path):
     out = ["//! Generated alpha masks: Adwaita symbolic icons (CC BY-SA 3.0) and cairo-drawn",
            "//! brightness glyphs, rendered at native Touch Bar size by `touchbar-icons.py`.", "",
            "use crate::stock_labels::AlphaMask;", ""]
-    for name in ORDER + ["PLAY", "PAUSE", "APPS", "CLOSE"]:
+    for name in ORDER + EXTRA:
         w, h, px = icons[name]
         out.append(f"const {name}_PIXELS: &[u8] = &[")
         for i in range(0, len(px), 24):

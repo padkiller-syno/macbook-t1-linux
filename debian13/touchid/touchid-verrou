@@ -1,0 +1,15 @@
+#!/bin/sh
+# Touch ID refusé tant que le mot de passe n'a pas été saisi une fois depuis le démarrage (comme macOS) : la
+# première ouverture de session déverrouille aussi le trousseau GNOME, qui a besoin du mot de passe.
+# Appelé par pam_exec (voir install-touchid-premier-login.sh) :
+#   touchid-verrou verrouille   0 si le mot de passe n'a pas encore été saisi (common-auth saute alors pam_fprintd)
+#   touchid-verrou ouvert       0 si Touch ID est permis (gdm-fingerprint : requisite)
+#   touchid-verrou marquer      après un pam_unix réussi : Touch ID permis jusqu'au prochain démarrage
+# Le témoin est dans /run (tmpfs, vidé à chaque démarrage).
+T=/run/touchid-mot-de-passe-saisi
+case "${1:-}" in
+  verrouille) [ ! -e "$T" ] ;;
+  ouvert) [ -e "$T" ] ;;
+  marquer) : > "$T" 2>/dev/null; exit 0 ;;
+  *) exit 1 ;;
+esac

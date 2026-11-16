@@ -551,6 +551,17 @@ benoit », « Autorisation administrateur (polkit) »…), **les essais restants
   [`touchid/install-touchid-context.sh`](touchid/install-touchid-context.sh)
   (`… annuler` pour retirer ; sauvegardes dans `/root/backup-pam/`). Essais et
   délai sont repris de la ligne `pam_fprintd` de `common-auth`.
+- **Touch ID après un premier mot de passe** (16/11) : comme macOS, Touch ID
+  n'est proposé qu'après une saisie du mot de passe depuis le démarrage
+  (connexion, sudo, polkit…), ce qui déverrouille aussi le trousseau GNOME.
+  [`touchid/touchid-verrou`](touchid/touchid-verrou) (`verrouille` / `ouvert` /
+  `marquer`, témoin `/run/touchid-mot-de-passe-saisi`), installé par
+  [`touchid/install-touchid-premier-login.sh`](touchid/install-touchid-premier-login.sh)
+  (`… annuler`). `common-auth` : `verrouille` en `[success=2 default=ignore]`
+  avant le contexte (un échec du script laisse Touch ID proposé, au lieu de
+  faire échouer la pile), `pam_fprintd` passe à `success=3`, `marquer` en
+  `optional` juste après `pam_deny` (atteint seulement par le saut de
+  `pam_unix`) ; `gdm-fingerprint` : `ouvert` en `requisite`.
 - **Piège** : sans l'option `seteuid`, `pam_exec` lance le script sous
   l'utilisateur **réel** (pas root) : il ne peut pas écrire dans
   `/run/t1bridge` et rien ne s'affiche, sans aucune erreur (`quiet`).

@@ -6,11 +6,11 @@
 # - veille S3 (« deep ») autorisée, hibernation toujours interdite (jamais testée) ;
 # - aucun périphérique PCI en D3cold (règle udev) : sans ça la machine gèle en s'endormant ;
 # - Wi-Fi (brcmfmac) rechargé au réveil : sinon il ne s'associe plus ;
-# - Touch ID coupé au réveil jusqu'au redémarrage (la T1 ne répond plus) : mot de passe demandé directement ;
 # - garde-fou : si le module amdgpu patché n'est pas chargé (autre noyau…), la veille est bloquée ;
 # - capot fermé : veille sur batterie, verrouillage sur secteur, rien avec un écran externe.
 # - Thunderbolt éteint avant la veille et rallumé au réveil (méthodes ACPI d'Apple SXFP/TRPE, comme macOS) ;
-# Connu : après une veille, Touch Bar noire (tactile OK) ; un chargeur branché pendant la veille fige le contrôleur
+# - Touch Bar et Touch ID au réveil : ACPI ASOC.SOCW, comme macOS.
+# Connu : un chargeur branché pendant la veille fige le contrôleur
 # Thunderbolt de son côté jusqu'au redémarrage (le capot ne met en veille que sur batterie).
 set -euo pipefail
 [ "$(id -u)" = 0 ] || { echo "Lance-moi avec sudo"; exit 1; }
@@ -24,7 +24,7 @@ GARDE=/etc/systemd/system/veille-garde.service
 
 if [ "${1:-}" = annuler ]; then
   systemctl disable --now veille-garde.service 2>/dev/null || true
-  rm -f "$SLEEP_OK" "$RULE" "$HOOK" "$GARDE"
+  rm -f "$SLEEP_OK" "$RULE" "$HOOK" "$GARDE"; rm -rf /usr/local/lib/veille-macbook
   cp -p "$SAVE/pas-de-veille.conf" "$SLEEP_BAN"
   cp -p "$SAVE/10-capot-verrouille.conf" "$LID"
   systemctl daemon-reload; udevadm control --reload
@@ -58,6 +58,7 @@ EOF
 udevadm control --reload
 for f in /sys/bus/pci/devices/*/d3cold_allowed; do echo 0 > "$f" 2>/dev/null || true; done
 
+install -D -m 755 "$(dirname "$(readlink -f "$0")")/t1-hid-feature.py" /usr/local/lib/veille-macbook/t1-hid-feature.py
 cat > "$HOOK" <<'EOF'
 #!/bin/sh
 # MacBookPro13,3, veille S3 :
@@ -66,24 +67,31 @@ cat > "$HOOK" <<'EOF'
 #   (broches « force power » à 0). Au réveil : NHI0.TRPE(1,0) puis redétection PCI des ports racine.
 #   Limite : un chargeur branché pendant la veille fige le contrôleur de son côté (redémarrage, ou veille sans).
 #   Voir tb-go2sx.sh et le README (~/git/macbook-t1-linux/debian13/veille/).
+# - Touch Bar (T1) : comme macOS (pilote AppleEmbeddedOSSupportHost), on prévient la T1 par le SMC que l'hôte
+#   s'endort (ACPI ASOC.SOCW(0) → MBOX 1) puis se réveille (SOCW(1) → MBOX 6, 2). Sans SOCW(1) la T1 accepte les
+#   images mais garde la dalle éteinte (Touch ID marche aussi après). Voir t1-socw.sh ;
+#   puis rapport HID 3 = 02 f4 01 (interface 6 de la T1) : défait le « garage » d'appletbdrm à l'endormissement
+#   (rapport 3 = 01, luminosité minimale), comme macOS au réveil ;
 # - le Wi-Fi BCM43602 ne s'associe plus → rechargement de brcmfmac ;
-# - la T1 ne fait plus de Touch ID (ni d'affichage) jusqu'au redémarrage → fprintd masqué pour cette session
-#   (--runtime : effacé au prochain démarrage), le mot de passe est demandé tout de suite au lieu d'attendre 30 s.
 UPSB="0000:04:00.0 0000:7a:00.0"; ROOT="0000:00:01.1 0000:00:01.2"
+ASOC='\_SB.PCI0.XHC1.RHUB.ASOC'
 acpi() { printf '%s\n' "$1" > /proc/acpi/call && cat /proc/acpi/call > /dev/null; }
 retirer() { for b in $UPSB; do [ -e /sys/bus/pci/devices/$b ] && echo 1 > /sys/bus/pci/devices/$b/remove; done; }
 case "$1" in
   pre)
-    modprobe acpi_call && { retirer; sleep 1
+    modprobe acpi_call && { acpi "$ASOC.SOCW 0"; retirer; sleep 1
       for p in PEG1 PEG2; do acpi "\\_SB.PCI0.$p.UPSB.DSB0.NHI0.SXFP 0"; done; } ;;
   post)
     if modprobe acpi_call; then
+      acpi "$ASOC.SOCW 1"
       for p in PEG1 PEG2; do acpi "\\_SB.PCI0.$p.UPSB.DSB0.NHI0.TRPE 1 0"; done
       sleep 1; retirer
       for r in $ROOT; do echo on > /sys/bus/pci/devices/$r/power/control; echo 1 > /sys/bus/pci/devices/$r/rescan; done
     fi
-    systemctl mask --runtime --now fprintd.service t1-touchid-auth.service t1-touchid-auth.socket 2>/dev/null
-    modprobe -r brcmfmac_wcc 2>/dev/null; modprobe -r brcmfmac && sleep 1 && modprobe brcmfmac ;;
+    modprobe -r brcmfmac_wcc 2>/dev/null; modprobe -r brcmfmac && sleep 1 && modprobe brcmfmac
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      python3 -I /usr/local/lib/veille-macbook/t1-hid-feature.py 3 02 f4 01 > /dev/null 2>&1 && break; sleep 0.5
+    done ;;
 esac
 EOF
 chmod 755 "$HOOK"

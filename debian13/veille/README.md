@@ -8,7 +8,8 @@
 
 - `sleep.conf.d/veille-s3.conf` : veille S3 autorisée, hibernation interdite (jamais testée) ;
 - règle udev `90-macbook-pas-de-d3cold.rules` : aucun périphérique PCI en D3cold (sinon gel à l'endormissement) ;
-- `system-sleep/veille-macbook` : rechargement de brcmfmac au réveil (Wi-Fi) ;
+- `system-sleep/veille-macbook` : Thunderbolt éteint/rallumé, T1 prévenue par le SMC (`SOCW`) et Touch Bar
+  « dégarée », rechargement de brcmfmac au réveil (Wi-Fi) ;
 - `veille-garde.service` : bloque la veille (`systemd-inhibit`) si le module amdgpu patché n'est pas chargé ;
 - `logind.conf.d/10-capot-verrouille.conf` : capot = veille sur batterie, verrouillage sur secteur, rien si écran externe.
 
@@ -37,6 +38,8 @@ carte au démarrage, la VRAM passe à `0xF400000000`, et le réveil comme les re
   `T1UNBIND=1` (appletbdrm détaché pendant la veille).
 - `reparer-reveil.sh wifi|touchbar|tb` : remises en route après réveil.
 - `t1-hid-feature.py [tout | 3 <octets>]` : rapports HID feature de la T1 (interface 6).
+- `t1-socw.sh etat|0|1` : appel ACPI `ASOC.SOCW` à la main (signal veille/réveil à la T1 par le SMC).
+- `test-t1-reveil.sh` : ancien essai (séquence HID macOS + réénumération), inutile depuis `SOCW` ; perd le tactile.
 
 ## Après un réveil (mode 4)
 
@@ -44,7 +47,7 @@ carte au démarrage, la VRAM passe à `0xF400000000`, et le réveil comme les re
 |---|---|
 | Radeon, session, écrans externes, souris | OK |
 | Wi-Fi (BCM43602) | ne s'associe plus ; OK après `reparer-reveil.sh wifi` (reload brcmfmac) |
-| Touch Bar | tactile OK, écran noir jusqu'au redémarrage (t1bridge #18) ; voir « Touch Bar » ci-dessous (séquence macOS rejouée sans effet) |
+| Touch Bar, Touch ID | **OK** depuis le 16/11 (hook : `SOCW` + rapport 3 = `02 f4 01`), voir « Touch Bar » ci-dessous |
 | Thunderbolt (USB 3, réseau du dock) | **OK** depuis le 16/11 (hook : SXFP avant, TRPE + rescan après, 14/14, écrans et réseau du dock OK) ; sauf le côté où un chargeur est branché pendant la veille |
 | Mode 1 (D3cold permis) | gel pendant l'endormissement, sans journal |
 
@@ -69,7 +72,7 @@ et désassemblage du kext extrait de `BootKernelExtensions.kc` (capstone ; l'obj
 - ACPI décompilé avec les références externes résolues : `~/git/t1/acpi/resolu/` ; kernel collection du 14,3 :
   `~/git/t1/mac2017/`.
 
-## Touch Bar (non résolu, 16/11)
+## Touch Bar : résolu le 16/11 (`t1-socw.sh`, intégré au hook)
 
 Capture USB de la T1 sous macOS 13.7.8 (MacBookPro14,3, SIP désactivé, `ifconfig XHC20 up` + `tcpdump`,
 `~/git/t1/mac2017/t1-veille.pcap` et `capture-veille.sh`). Interface 6 (hub de capteurs, SET_REPORT feature) :
@@ -85,7 +88,18 @@ Capture USB de la T1 sous macOS 13.7.8 (MacBookPro14,3, SIP désactivé, `ifconf
 - Rapports (descripteur HID) : 2 = `0x20` u8, `0x21` u8 (2 = éteint, 1 = allumé), `0x22`, `0x23` u32 (rampe
   150 → 1000) ; 3 = `0x31` état d'affichage, `0x32`, `0x50`, `0x51` u64 ; 4 = mesures en direct (pas un réglage) ;
   5 = écriture, puis relisible. L'interface 2.7 (`ff/f9/11`, DRCS) sert à Touch ID.
-- Piste restante : ce qui fait redémarrer l'affichage de bridgeOS (REDY spontané) sous macOS et pas sous Linux.
+- **Cause** : macOS prévient la T1 **par le SMC** de la veille et du réveil. Le pilote `AppleEmbeddedOSSupportHost`
+  (kext de `SystemKernelExtensions.kc`, rattaché à l'ACPI `APP7777` = `\_SB.PCI0.XHC1.RHUB.ASOC`, SSDT8) appelle
+  `ASOC.SOCW(0)` sur `kIOMessageSystemWillSleep` (`0xe0000280`) et `SOCW(1)` sur `kIOMessageSystemHasPoweredOn`
+  (`0xe0000320`), journal `log show --predicate 'sender == "AppleEmbeddedOSSupportHost"'`. `SOCW` appelle `MBOX`
+  (DSDT : commande dans l'EC `INDX`/`DATA`/`CMDS` puis poignée de main GPIO `0x0106000A`/`0x0106000F`, active si
+  `MBXC` ≠ 0, ici 2) : `SOCW(0)` = `MBOX(1)`, `SOCW(1)` = `MBOX(6)` puis `MBOX(2)`. Linux ne l'appelait jamais.
+- Sans `SOCW(1)`, tout a l'air normal côté USB : REDY, images acceptées (`UDCL` avec horodatage valide), rapports HID
+  « allumé »… mais la dalle reste noire. `SOCW(1)` à la main : `0x0` en 82 ms (88 ms sous macOS), dalle rallumée.
+- Il faut aussi « dégarer » : appletbdrm envoie rapport 3 = `01 f4 01` à l'endormissement, et rien ne le défait →
+  dalle allumée mais à luminosité minimale (rapport 3 = `01`, rapport 4 à zéro). macOS envoie `02 f4 01` au réveil.
+- Touch ID marche aussi après le réveil (le masquage de fprintd est retiré du hook).
+- La réénumération (`persist=0`) et les rapports 2/5 de macOS sont inutiles.
 
 ## Thunderbolt et ACPI Apple (`tb-acpi.sh`, ancienne piste)
 

@@ -45,10 +45,31 @@ carte au démarrage, la VRAM passe à `0xF400000000`, et le réveil comme les re
 | Radeon, session, écrans externes, souris | OK |
 | Wi-Fi (BCM43602) | ne s'associe plus ; OK après `reparer-reveil.sh wifi` (reload brcmfmac) |
 | Touch Bar | tactile OK, écran noir jusqu'au redémarrage (t1bridge #18) ; ni le rapport HID 3 (`02` = allumé), ni le rebind d'appletbdrm, ni la coupure du port USB ne la rallument |
-| Thunderbolt (USB 3, réseau du dock) | contrôleurs en D3cold « inaccessibles » ; remove/rescan les fait disparaître (écrans externes compris) ; voir ci-dessous |
+| Thunderbolt (USB 3, réseau du dock) | **OK** depuis le 16/11 (hook : SXFP avant, TRPE + rescan après, 14/14, écrans et réseau du dock OK) ; sauf le côté où un chargeur est branché pendant la veille |
 | Mode 1 (D3cold permis) | gel pendant l'endormissement, sans journal |
 
-## Thunderbolt et ACPI Apple (`tb-acpi.sh`, non résolu)
+## Thunderbolt : résolu le 16/11 (`tb-go2sx.sh`, intégré au hook)
+
+Trouvé en observant macOS 13.7.8 sur un MacBookPro14,3 (mêmes Alpine Ridge JHL6540, même SSDT) : traces
+`AppleThunderboltNHIType3` activées par `boot-args="tblog=0xffff"` (posé depuis la récupération, SIP refuse sinon),
+et désassemblage du kext extrait de `BootKernelExtensions.kc` (capstone ; l'objet pointe sur `vtable+0x10`).
+
+- **Cause** : un Alpine Ridge **alimenté** pendant S3 a son firmware figé au réveil (port racine en détection,
+  LTSSM `0xC74` = 0/1 au lieu de 3, LnkSta x0). Ni TRPE, ni Retrain Link, ni Secondary Bus Reset, ni Link Disable ne
+  le relancent après coup. macOS l'éteint dès qu'il ne sert plus (`enablePower(0)`, runtime PM) : il passe S3 hors
+  tension et redémarre à froid.
+- **Correctif** (hook `system-sleep/veille-macbook`) : `pre` = retrait PCI des ponts amont (`04:00.0`, `7a:00.0`) puis
+  `NHI0.SXFP(0)` (broches « force power » à 0) ; `post` = `NHI0.TRPE(1,0)` puis rescan des ports racine `00:01.1`/`.2`.
+  Une veille propre ressuscite même un contrôleur figé par la précédente.
+- **Limite** : un chargeur branché pendant la veille garde le contrôleur USB-C de son côté actif et fige l'Alpine
+  Ridge de ce côté (PEG1 = ports gauches, PEG2 = droite). Sans conséquence pour le capot (veille sur batterie seulement).
+- **Go2Sx** (`VSEC 0x500` + `0x4c` ← 5, écho attendu à + `0x48`) : macOS l'envoie, mais le firmware n'a jamais répondu
+  sous Linux (ni à chaud, ni NHI en D3hot) ; inutile ici.
+- `XRST` ne pose qu'un drapeau ACPI lu nulle part. `_WAK` n'appelle `ICMB` (démarrage du firmware ICM) que hors Darwin.
+- ACPI décompilé avec les références externes résolues : `~/git/t1/acpi/resolu/` ; kernel collection du 14,3 :
+  `~/git/t1/mac2017/`.
+
+## Thunderbolt et ACPI Apple (`tb-acpi.sh`, ancienne piste)
 
 SSDT `TbtPEG12` (décompilée avec `acpidump -b` + `iasl`) : Linux répond `_OSI("Darwin")`, donc les méthodes
 « macOS » sont actives. `_PS3` des ponts coupe le courant (GPIO via `UGIO`) si `RTBT`/`RUSB` = 0 ; `_PS0` ne le

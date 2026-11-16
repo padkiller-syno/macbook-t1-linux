@@ -29,7 +29,7 @@ GNOME 48 / **Wayland**, LUKS + LVM. Session de remise en état du 20/10/2026.
 | **Modules T1 sous DKMS** | ✅ reconstruits à chaque nouveau kernel | [`dkms/`](#après-une-mise-à-jour-du-kernel--dkms) |
 | **Thunderbolt 3 : USB 3 des écrans** (Ethernet) | ✅ runtime PM désactivé sur les contrôleurs USB 3 Alpine Ridge | [ici](#thunderbolt-3--usb-3-des-écrans--docks-perdu-ethernet-etc) |
 | **Écran de démarrage** (LUKS) | ✅ pomme blanche sur fond noir, saisie façon macOS (Plymouth) | [`demarrage/`](#écran-de-démarrage--pomme--plymouth) |
-| Veille S3 | ✅ depuis le 16/11/2026 (amdgpu patché) : écran, Thunderbolt, Wi-Fi, Touch Bar et Touch ID reviennent ; hibernation toujours interdite | [`veille/`](#veille-et-hibernation) |
+| Veille S3 | ✅ depuis le 16/11/2026 (amdgpu patché) : écran, Thunderbolt, Touch Bar, Touch ID et son reviennent ; Wi-Fi limité au 2,4 GHz jusqu'au redémarrage ; hibernation toujours interdite | [`veille/`](veille/README.md) |
 
 ---
 

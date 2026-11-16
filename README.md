@@ -42,7 +42,7 @@ configurer (projet [t1bridge](https://github.com/standardagents/t1bridge)).
 | **Modules T1 sous DKMS** | ✅ reconstruits à chaque nouveau kernel | [`dkms/`](debian13/README.md#après-une-mise-à-jour-du-kernel--dkms) |
 | **Thunderbolt 3 : USB 3 des écrans** (Ethernet) | ✅ runtime PM désactivé sur les contrôleurs USB 3 Alpine Ridge | [détails](debian13/README.md#thunderbolt-3--usb-3-des-écrans--docks-perdu-ethernet-etc) |
 | **Écran de démarrage** (LUKS) | ✅ pomme blanche sur fond noir, saisie façon macOS (Plymouth) | [`demarrage/`](debian13/README.md#écran-de-démarrage--pomme--plymouth) |
-| Veille / hibernation | ❌ impossible : la Radeon Polaris ne se réveille pas → **interdites** au niveau système | [`veille/`](debian13/README.md#veille-et-hibernation--impossibles-amdgpu) |
+| Veille S3 | ✅ depuis le 16/11/2026 (amdgpu patché) : écran, Thunderbolt, Touch Bar, Touch ID et son reviennent ; Wi-Fi limité au 2,4 GHz jusqu'au redémarrage ; hibernation interdite | [`veille/`](debian13/veille/README.md) |
 
 ## Touch Bar
 

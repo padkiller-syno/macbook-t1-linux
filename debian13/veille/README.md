@@ -44,7 +44,7 @@ carte au démarrage, la VRAM passe à `0xF400000000`, et le réveil comme les re
 |---|---|
 | Radeon, session, écrans externes, souris | OK |
 | Wi-Fi (BCM43602) | ne s'associe plus ; OK après `reparer-reveil.sh wifi` (reload brcmfmac) |
-| Touch Bar | tactile OK, écran noir jusqu'au redémarrage (t1bridge #18) ; ni le rapport HID 3 (`02` = allumé), ni le rebind d'appletbdrm, ni la coupure du port USB ne la rallument |
+| Touch Bar | tactile OK, écran noir jusqu'au redémarrage (t1bridge #18) ; voir « Touch Bar » ci-dessous (séquence macOS rejouée sans effet) |
 | Thunderbolt (USB 3, réseau du dock) | **OK** depuis le 16/11 (hook : SXFP avant, TRPE + rescan après, 14/14, écrans et réseau du dock OK) ; sauf le côté où un chargeur est branché pendant la veille |
 | Mode 1 (D3cold permis) | gel pendant l'endormissement, sans journal |
 
@@ -68,6 +68,24 @@ et désassemblage du kext extrait de `BootKernelExtensions.kc` (capstone ; l'obj
 - `XRST` ne pose qu'un drapeau ACPI lu nulle part. `_WAK` n'appelle `ICMB` (démarrage du firmware ICM) que hors Darwin.
 - ACPI décompilé avec les références externes résolues : `~/git/t1/acpi/resolu/` ; kernel collection du 14,3 :
   `~/git/t1/mac2017/`.
+
+## Touch Bar (non résolu, 16/11)
+
+Capture USB de la T1 sous macOS 13.7.8 (MacBookPro14,3, SIP désactivé, `ifconfig XHC20 up` + `tcpdump`,
+`~/git/t1/mac2017/t1-veille.pcap` et `capture-veille.sh`). Interface 6 (hub de capteurs, SET_REPORT feature) :
+
+| Moment | macOS | Linux |
+|---|---|---|
+| endormissement | rapport 3 = `01 f4 01` (garage) + CLRD ×2 ; rapport 2 = `01 02` | appletbdrm : garage + CLRD |
+| réveil | **la T1 se déconnecte d'elle-même** (« connect change »), réénumération, REDY **spontané** de la T1, puis GINF/REDY/CLRD, rapport 5 = `01 00…00 0b 00…` (116 o), rapport 3 = `02 f4 01`, rapport 2 = `01 01`, images | reset-resume (même périphérique), appletbdrm_t1_rearm (GINF/REDY/CLRD), rien d'autre |
+
+- Rejoué à l'identique (`test-t1-reveil.sh` : rapport 2 avant la veille, `persist=0` pour réénumérer, puis rapports
+  5/3/2) : la T1 accepte tout, se réénumère, mais l'écran reste noir ; et le tactile est perdu (pire que sans).
+- bridgeOS reste vivant après la veille (ping `fe80::aede:48ff:fe33:4455%eth0` OK, capteur de lumière OK).
+- Rapports (descripteur HID) : 2 = `0x20` u8, `0x21` u8 (2 = éteint, 1 = allumé), `0x22`, `0x23` u32 (rampe
+  150 → 1000) ; 3 = `0x31` état d'affichage, `0x32`, `0x50`, `0x51` u64 ; 4 = mesures en direct (pas un réglage) ;
+  5 = écriture, puis relisible. L'interface 2.7 (`ff/f9/11`, DRCS) sert à Touch ID.
+- Piste restante : ce qui fait redémarrer l'affichage de bridgeOS (REDY spontané) sous macOS et pas sous Linux.
 
 ## Thunderbolt et ACPI Apple (`tb-acpi.sh`, ancienne piste)
 

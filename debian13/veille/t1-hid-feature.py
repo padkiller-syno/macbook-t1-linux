@@ -15,6 +15,13 @@ import os
 import sys
 
 SIZE = 15  # ID compris, comme dans appletbdrm_t1_park()
+# Taille réelle des rapports (ID compris), d'après le descripteur HID de l'interface 6 :
+#   2 : 0x20 u8, 0x21 u8, 0x22 u32, 0x23 u32                      (pareil Touch Bar allumée / noire)
+#   3 : 0x31 u8 état d'affichage (1 = garée, 2 = allumée), 0x32 u32, 0x50 u8, 0x51 u64 (compteur)
+#   4 : 0x10 u8, 0x11 u32 (0..2 000 000), 0x12 u32 (0..1000), 0x13 u32  — allumée : 03 b2 6a 01 00 f0 00 …,
+#       noire après veille : tout à 0 (rétroéclairage ?)
+#   5 : 0x40 u16, 0x41 u8, 0x42 u32, 0x43 u32, 0x44 u16, 0x45 u16, 0x46 u32, 0x47 12×u32, 0x48 12×u32 (écriture seule)
+SIZES = {2: 11, 3: 15, 4: 14, 5: 116}
 
 
 def ioc(direction, nr, size):
@@ -43,12 +50,15 @@ def main():
     rid = int(sys.argv[1]) if len(sys.argv) > 1 else 3
     with open(dev, "rb+", buffering=0) as f:
         if len(sys.argv) > 2:
-            data = bytes([rid] + [int(x, 16) for x in sys.argv[2:]]).ljust(SIZE, b"\0")
+            data = bytes([rid] + [int(x, 16) for x in sys.argv[2:]]).ljust(SIZES.get(rid, SIZE), b"\0")
             fcntl.ioctl(f, ioc(3, 0x06, len(data)), data)  # HIDIOCSFEATURE
             print(f"{dev} écrit : {data.hex(' ')}")
-        buf = bytearray([rid] + [0] * (SIZE - 1))
-        n = fcntl.ioctl(f, ioc(3, 0x07, len(buf)), buf, True)  # HIDIOCGFEATURE
-        print(f"{dev} rapport {rid} : {bytes(buf[:max(n, 1)]).hex(' ')}")
+        buf = bytearray([rid] + [0] * 127)
+        try:
+            n = fcntl.ioctl(f, ioc(3, 0x07, len(buf)), buf, True)  # HIDIOCGFEATURE
+            print(f"{dev} rapport {rid} : {bytes(buf[:max(n, 1)]).hex(' ')}")
+        except OSError as error:  # le rapport 5 est en écriture seule
+            print(f"{dev} rapport {rid} : relecture impossible ({error.strerror})")
 
 
 if __name__ == "__main__":

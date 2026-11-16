@@ -6,6 +6,7 @@
 # - veille S3 (« deep ») autorisée, hibernation toujours interdite (jamais testée) ;
 # - aucun périphérique PCI en D3cold (règle udev) : sans ça la machine gèle en s'endormant ;
 # - Wi-Fi (brcmfmac) rechargé au réveil : sinon il ne s'associe plus ;
+# - Touch ID coupé au réveil jusqu'au redémarrage (la T1 ne répond plus) : mot de passe demandé directement ;
 # - garde-fou : si le module amdgpu patché n'est pas chargé (autre noyau…), la veille est bloquée ;
 # - capot fermé : veille sur batterie, verrouillage sur secteur, rien avec un écran externe.
 # Connu : après une veille, Touch Bar noire (tactile OK) et Thunderbolt/dock perdus jusqu'au redémarrage.
@@ -57,9 +58,14 @@ for f in /sys/bus/pci/devices/*/d3cold_allowed; do echo 0 > "$f" 2>/dev/null || 
 
 cat > "$HOOK" <<'EOF'
 #!/bin/sh
-# MacBookPro13,3 : le Wi-Fi BCM43602 ne s'associe plus après une veille S3 → rechargement de brcmfmac.
+# MacBookPro13,3 après une veille S3 :
+# - le Wi-Fi BCM43602 ne s'associe plus → rechargement de brcmfmac ;
+# - la T1 ne fait plus de Touch ID (ni d'affichage) jusqu'au redémarrage → fprintd masqué pour cette session
+#   (--runtime : effacé au prochain démarrage), le mot de passe est demandé tout de suite au lieu d'attendre 30 s.
 case "$1" in
-  post) modprobe -r brcmfmac_wcc 2>/dev/null; modprobe -r brcmfmac && sleep 1 && modprobe brcmfmac ;;
+  post)
+    systemctl mask --runtime --now fprintd.service t1-touchid-auth.service t1-touchid-auth.socket 2>/dev/null
+    modprobe -r brcmfmac_wcc 2>/dev/null; modprobe -r brcmfmac && sleep 1 && modprobe brcmfmac ;;
 esac
 EOF
 chmod 755 "$HOOK"

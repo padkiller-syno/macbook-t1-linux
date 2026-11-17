@@ -12,19 +12,36 @@ RUN=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
 OFF=$RUN/facetime-auto.off
 STATE=$RUN/facetime-auto.state
 shown=
+# Format de la caméra virtuelle : YUYV (YU12 refusé par Firefox/Meet via PipeWire le 17/11)
+PIXFMT=${FACETIME_PIXFMT:-yuyv422}
+# Correction d'image (le capteur s'expose sur les fonds clairs : image délavée). Vide = image brute.
+# Pas d'accentuation : unsharp coûte ~60 % d'un cœur en 720p30, eq ~7 %.
+FILTRE=${FACETIME_FILTRE-eq=contrast=1.12:brightness=-0.02:saturation=1.35}
 
 t1_cam() { for d in /dev/video[0-9]; do v4l2-ctl -d "$d" --list-formats 2>/dev/null | grep -q H264 && { echo "$d"; return; }; done; }
 stop_src() { [ -n "$SRC" ] && { kill $SRC 2>/dev/null; wait $SRC 2>/dev/null; }; SRC=; MODE=; }
 start_black() {
   # 1 image/s suffit : sustain_framerate=1 fait répéter la dernière image aux lecteurs (5/s coûtait ~6 % d un cœur)
   ffmpeg -hide_banner -loglevel error -re -f lavfi -i color=black:s=1280x720:r=1 \
-         -pix_fmt yuyv422 -f v4l2 $LOOP & SRC=$!; MODE=noir
+         -pix_fmt $PIXFMT -f v4l2 $LOOP & SRC=$!; MODE=noir
 }
+# GPU de décodage : la Radeon (vendor 0x1002). Décodage H.264 logiciel = ~175 % d'un cœur, par VAAPI ~25 %.
+vaapi_dev() { for r in /dev/dri/renderD*; do [ "$(cat /sys/class/drm/${r##*/}/device/vendor 2>/dev/null)" = 0x1002 ] && { echo "$r"; return; }; done; }
 start_cam() {
-  local cam; cam=$(t1_cam); [ -n "$cam" ] || return 1
-  ffmpeg -hide_banner -loglevel error -f v4l2 -input_format h264 -video_size 1280x720 -framerate 30 -i "$cam" \
-         -vf format=yuyv422 -r 30 -f v4l2 $LOOP & SRC=$!; MODE=camera
-  echo "caméra activée"
+  local cam dev vf; cam=$(t1_cam); [ -n "$cam" ] || return 1
+  local in=(-f v4l2 -input_format h264 -video_size 1280x720 -framerate 30 -i "$cam")
+  dev=$(vaapi_dev)
+  if [ -n "$dev" ]; then
+    vf="hwdownload,format=nv12${FILTRE:+,$FILTRE},format=$PIXFMT"
+    ffmpeg -hide_banner -loglevel error -threads 1 -hwaccel vaapi -hwaccel_device "$dev" -hwaccel_output_format vaapi \
+           "${in[@]}" -filter_threads 1 -vf "$vf" -r 30 -f v4l2 $LOOP & SRC=$!
+    sleep 1
+    if kill -0 $SRC 2>/dev/null; then MODE=camera; echo "caméra activée (GPU $dev)"; return 0; fi
+    wait $SRC 2>/dev/null; echo "VAAPI en échec, décodage logiciel"
+  fi
+  vf="${FILTRE:+$FILTRE,}format=$PIXFMT"
+  ffmpeg -hide_banner -loglevel error "${in[@]}" -vf "$vf" -r 30 -f v4l2 $LOOP & SRC=$!; MODE=camera
+  echo "caméra activée (logiciel)"
 }
 
 # Format libre au démarrage (un ancien format gardé bloquerait la source), puis figé

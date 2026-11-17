@@ -64,7 +64,7 @@ refresh_cache() {  # valeurs lentes : lecteur, sortie, veilleuse, luminosité au
 
 status() {
   local caps=$((1 + 8 + 16)) display=1   # 1 audio, 8 retour de niveau, 16 écran
-  local v num int frac vol muted=0 extras="" ts=0 p="" out=0 night=- auto=1 sink=sp mic=- fx=- mp psm
+  local v num int frac vol muted=0 extras="" ts=0 p="" out=0 night=- auto=1 sink=sp mic=- fx=- mp psm prof
   v=$(wpctl get-volume $SINK 2>/dev/null) || exit 1   # « Volume: 0.23 [MUTED] »
   num=${v#Volume: }; num=${num%% *}; int=${num%%.*}; frac=${num#*.}00; frac=${frac:0:2}
   vol=$(( 10#$int * 100 + 10#$frac )); [ $vol -gt 100 ] && vol=100
@@ -98,6 +98,9 @@ status() {
   [ "${mic:--}" != - ] && extras+=" mic=$mic"
   [ "${fx:--}" != - ] && extras+=" fx=$fx"
   [ "$night" != - ] && extras+=" night=$night"
+  prof=$(busctl get-property org.freedesktop.UPower.PowerProfiles /org/freedesktop/UPower/PowerProfiles \
+         org.freedesktop.UPower.PowerProfiles ActiveProfile 2>/dev/null)
+  [ -n "$prof" ] && prof=${prof#s \"} && extras+=" prof=${prof%\"}"
   percent /sys/class/backlight/gmux_backlight; [ -n "$PCT" ] && extras+=" disp=$PCT"
   percent /sys/class/leds/spi::kbd_backlight; [ -n "$PCT" ] && extras+=" kbd=$PCT"
 
@@ -160,6 +163,10 @@ case "${2:-}" in
     refresh_soon ;;
   toggle-auto-brightness) toggle_gsetting org.gnome.settings-daemon.plugins.power ambient-enabled; refresh_soon ;;
   toggle-night-light)     toggle_gsetting org.gnome.settings-daemon.plugins.color night-light-enabled; refresh_soon ;;
+  set-power-profile)   # page Énergie : power-profiles-daemon (amdgpu-power-sync suit pour la Radeon)
+    case ${3:-} in power-saver|balanced|performance) ;; *) exit 2 ;; esac
+    busctl set-property org.freedesktop.UPower.PowerProfiles /org/freedesktop/UPower/PowerProfiles \
+      org.freedesktop.UPower.PowerProfiles ActiveProfile s "$3" ;;
   toggle-camera)   # coupure volontaire de la caméra virtuelle : facetime-auto envoie du noir et éteint la caméra réelle
     f=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/facetime-auto.off
     if [ -e "$f" ]; then rm -f "$f"; else : > "$f"; fi ;;

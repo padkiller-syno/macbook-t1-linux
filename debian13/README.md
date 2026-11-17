@@ -812,7 +812,7 @@ automatique ignore le réglage et le défait quelques secondes plus tard.
 
 ## Touch Bar : style capsules et jauges
 
-![Aperçu de la Touch Bar : barre principale et pages volume, éclairage, système](touchbar/apercu-pages.png)
+![Aperçu de la Touch Bar : barre principale et pages volume, éclairage, système, énergie, appel](touchbar/apercu-pages.png)
 
 Le rendu d'origine de t1bridge (plaques grises plates, icônes bitmap) est
 remplacé par
@@ -899,6 +899,12 @@ Aperçu : voir l'image en tête de cette section.
 - **système** : charge CPU, température et ventilateur, mémoire, batterie
   (% et watts), mode et puissance de la Radeon, lus **en Rust** dans `/proc` et
   `/sys` (`system_info.rs`), seulement quand le vumètre ou la page est affiché ;
+- **énergie** (17/11, derrière la page système : appui sur la batterie ou la
+  Radeon) : batterie, Radeon, et les trois profils de `power-profiles-daemon`
+  **Économie / Équilibré / Performance** (actif en vert / blanc / orange). Profil
+  lu par le renderer sur le bus système (`ActiveProfile`), changé par l'action
+  `set-power-profile` du fournisseur ; la Radeon suit par `amdgpu-power-sync`,
+  le menu de GNOME reste d'accord. Coût nul (barre toujours ~1,05 %) ;
 - **état du bureau lu par le renderer** (`native_status.rs`, crates `pulseaudio`
   et `zbus`) : abonnement aux événements de `pipewire-pulse` (volume, sortie,
   micro), connexion D-Bus permanente (Mutter, MPRIS, veilleuse), réglages GNOME

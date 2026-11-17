@@ -812,7 +812,7 @@ automatique ignore le réglage et le défait quelques secondes plus tard.
 
 ## Touch Bar : style capsules et jauges
 
-![Aperçu de la Touch Bar](touchbar/apercu-touchbar.png)
+![Aperçu de la Touch Bar : barre principale et pages volume, éclairage, système](touchbar/apercu-pages.png)
 
 Le rendu d'origine de t1bridge (plaques grises plates, icônes bitmap) est
 remplacé par
@@ -881,7 +881,7 @@ réception réveille la boucle aussitôt. Mesure : 2,2 % → 0,8 % d'un cœur.
 
 ### Pages, curseurs et état natif (16/11)
 
-![Pages de la Touch Bar](touchbar/apercu-pages.png)
+Aperçu : voir l'image en tête de cette section.
 
 - **barre principale** : esc, grille des applications, éclairage (écran et
   clavier, avec leurs jauges), média resserré, **vumètre CPU** (historique de la

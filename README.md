@@ -46,7 +46,7 @@ configurer (projet [t1bridge](https://github.com/standardagents/t1bridge)).
 
 ## Touch Bar
 
-![Aperçu de la Touch Bar](debian13/touchbar/apercu-touchbar.png)
+![Aperçu de la Touch Bar : barre principale et pages volume, éclairage, système](debian13/touchbar/apercu-pages.png)
 
 Touches en capsules, jauges, avancement du morceau et couleurs d'état (lecture,
 muet, casque/Bluetooth, veilleuse…) : rendu maison par un

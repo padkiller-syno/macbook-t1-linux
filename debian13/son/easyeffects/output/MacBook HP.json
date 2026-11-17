@@ -17,9 +17,9 @@
         "band0": {
           "type": "Hi-pass",
           "mode": "RLC (BT)",
-          "slope": "x2",
-          "frequency": 90.0,
-          "gain": 0.0,
+          "slope": "x1",
+          "frequency": 60.0,
+          "gain": 6.0,
           "q": 0.7,
           "solo": false,
           "mute": false
@@ -28,8 +28,8 @@
           "type": "Bell",
           "mode": "RLC (BT)",
           "slope": "x1",
-          "frequency": 170.0,
-          "gain": 6.5,
+          "frequency": 160.0,
+          "gain": 9.0,
           "q": 0.9,
           "solo": false,
           "mute": false
@@ -39,7 +39,7 @@
           "mode": "RLC (BT)",
           "slope": "x1",
           "frequency": 480.0,
-          "gain": -2.5,
+          "gain": 2.24,
           "q": 1.2,
           "solo": false,
           "mute": false
@@ -49,7 +49,7 @@
           "mode": "RLC (BT)",
           "slope": "x1",
           "frequency": 3200.0,
-          "gain": 1.5,
+          "gain": 0.83,
           "q": 1.0,
           "solo": false,
           "mute": false
@@ -59,7 +59,7 @@
           "mode": "RLC (BT)",
           "slope": "x1",
           "frequency": 9000.0,
-          "gain": 3.0,
+          "gain": 12.28,
           "q": 0.7,
           "solo": false,
           "mute": false
@@ -69,9 +69,9 @@
         "band0": {
           "type": "Hi-pass",
           "mode": "RLC (BT)",
-          "slope": "x2",
-          "frequency": 90.0,
-          "gain": 0.0,
+          "slope": "x1",
+          "frequency": 60.0,
+          "gain": 6.0,
           "q": 0.7,
           "solo": false,
           "mute": false
@@ -80,8 +80,8 @@
           "type": "Bell",
           "mode": "RLC (BT)",
           "slope": "x1",
-          "frequency": 170.0,
-          "gain": 6.5,
+          "frequency": 160.0,
+          "gain": 9.0,
           "q": 0.9,
           "solo": false,
           "mute": false
@@ -91,7 +91,7 @@
           "mode": "RLC (BT)",
           "slope": "x1",
           "frequency": 480.0,
-          "gain": -2.5,
+          "gain": 2.24,
           "q": 1.2,
           "solo": false,
           "mute": false
@@ -101,7 +101,7 @@
           "mode": "RLC (BT)",
           "slope": "x1",
           "frequency": 3200.0,
-          "gain": 1.5,
+          "gain": 0.83,
           "q": 1.0,
           "solo": false,
           "mute": false
@@ -111,7 +111,7 @@
           "mode": "RLC (BT)",
           "slope": "x1",
           "frequency": 9000.0,
-          "gain": 3.0,
+          "gain": 12.28,
           "q": 0.7,
           "solo": false,
           "mute": false
@@ -142,11 +142,11 @@
     "bass_enhancer#0": {
       "bypass": false,
       "input-gain": 0.0,
-      "output-gain": 0.0,
-      "amount": 6.0,
-      "harmonics": 8.5,
+      "output-gain": 1.0,
+      "amount": 9.0,
+      "harmonics": 8.0,
       "scope": 160.0,
-      "floor": 30.0,
+      "floor": 40.0,
       "floor-active": true,
       "blend": 0.0,
       "listen": false

@@ -126,11 +126,11 @@ micro** (carte son USB, sans pilote), ou casque **Bluetooth** (profil HFP).
 `sudo apt install easyeffects lsp-plugins-lv2 calf-plugins`) installe :
 
 - **« MacBook HP »** (sortie), chargé seulement sur la route
-  `analog-output-speaker` (pas au casque) : Bass Enhancer calf (harmoniques
-  des graves sous 160 Hz, que l'oreille rattache à la note) → égaliseur LSP
-  (passe-haut 90 Hz pour ne pas forcer les haut-parleurs, +6,5 dB à 170 Hz,
-  −2,5 dB à 480 Hz, +1,5 dB à 3,2 kHz, +3 dB au-dessus de 9 kHz) → limiteur
-  (+6 dB, seuil −1 dB). Réglé à l'oreille, sans mesure.
+  `analog-output-speaker` (pas au casque) : Bass Enhancer calf (9 dB,
+  harmoniques des graves sous 160 Hz, que l'oreille rattache à la note) →
+  égaliseur LSP (passe-haut 60 Hz, +9 dB à 160 Hz, +2,2 dB à 480 Hz,
+  +0,8 dB à 3,2 kHz, +12,3 dB au-dessus de 9 kHz) → limiteur (+6 dB, seuil
+  −1 dB) : ne sature pas même à fond. Réglé à l'oreille, sans mesure.
 - **« Micro MacBook »** (entrée) : débruitage **DeepFilterNet**. Le paquet
   Debian d'EasyEffects 7.2 est compilé sans RNNoise ni DeepFilterNet
   (« Enlèvement du bruit profond indisponible ») : le script télécharge le

@@ -905,6 +905,17 @@ Aperçu : voir l'image en tête de cette section.
   relus seulement quand dconf change. Le script du fournisseur ne sert plus
   qu'aux actions et en secours (`T1BRIDGE_NATIVE_STATUS=0` pour y revenir,
   `T1_NATIVE_DEBUG=1` pour tracer les événements son) ;
+- **appel** (17/11) : dès qu'une application enregistre le micro (flux
+  PipeWire), la page Appel s'ouvre seule : appli (Meet reconnu au titre
+  « Meet – … » du flux Firefox, Talk, WhatsApp/Karere, Teams, Zoom…) et durée,
+  **micro coupé au niveau du système** (toutes les applis reçoivent du silence),
+  **caméra coupée** (témoin `$XDG_RUNTIME_DIR/facetime-auto.off` :
+  [`facetime-auto`](camera/facetime-auto) envoie du noir et éteint la vraie
+  caméra, voyant compris), sourdine, volume ; × la cache, la case du vumètre
+  affiche alors l'appel (rouge si micro coupé) et la rouvre ; retour à la barre
+  principale à la fin de l'appel. Testé avec Meet (Firefox) et Nextcloud Talk.
+  Pas de bouton « raccrocher » : aucune interface commune sous Linux (piste :
+  extension Firefox pour Meet) ;
 - masques des plaques arrondies mis en cache (la barre est redessinée par le
   vumètre).
 

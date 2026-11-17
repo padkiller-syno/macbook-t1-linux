@@ -184,8 +184,13 @@ icons["KEYBOARD"] = svg_mask("devices/input-keyboard-symbolic.svg", ICON)
 icons["EFFECTS"] = equalizer(ICON)
 icons["CPU"] = chip(ICON)
 icons["BATTERY"] = svg_mask("legacy/battery-full-charging-symbolic.svg", ICON)
+# barre d'appel (17/11)
+icons["CALL"] = svg_mask("actions/call-start-symbolic.svg", ICON)
+icons["HANG_UP"] = svg_mask("actions/call-stop-symbolic.svg", ICON)
+icons["CAMERA"] = svg_mask("devices/camera-web-symbolic.svg", ICON)
+icons["CAMERA_OFF"] = svg_mask("status/camera-disabled-symbolic.svg", ICON)
 EXTRA = ["PLAY", "PAUSE", "APPS", "CLOSE", "MIC", "MIC_OFF", "SPEAKERS", "HEADPHONES", "BLUETOOTH",
-         "NIGHT", "KEYBOARD", "EFFECTS", "CPU", "BATTERY"]
+         "NIGHT", "KEYBOARD", "EFFECTS", "CPU", "BATTERY", "CALL", "HANG_UP", "CAMERA", "CAMERA_OFF"]
 labels ={"ESC": text_mask("esc", 20)}
 for i in range(1, 13):
     labels[f"F{i}"] = text_mask(f"F{i}", 20)

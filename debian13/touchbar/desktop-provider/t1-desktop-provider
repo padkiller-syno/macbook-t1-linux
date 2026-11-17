@@ -160,6 +160,9 @@ case "${2:-}" in
     refresh_soon ;;
   toggle-auto-brightness) toggle_gsetting org.gnome.settings-daemon.plugins.power ambient-enabled; refresh_soon ;;
   toggle-night-light)     toggle_gsetting org.gnome.settings-daemon.plugins.color night-light-enabled; refresh_soon ;;
+  toggle-camera)   # coupure volontaire de la caméra virtuelle : facetime-auto envoie du noir et éteint la caméra réelle
+    f=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/facetime-auto.off
+    if [ -e "$f" ]; then rm -f "$f"; else : > "$f"; fi ;;
   launch-app)   # N = rang dans le panneau ; l'id vient du cache écrit par t1-touchbar-apps (icône et lanceur alignés)
     [[ ${3:-} =~ ^[0-9]+$ ]] || exit 2
     read -r app <"${XDG_CACHE_HOME:-$HOME/.cache}/t1bridge/apps/$3.id" 2>/dev/null || exit 1

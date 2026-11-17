@@ -1202,7 +1202,7 @@ index 0000000..58058cd
 +    }
 +}
 diff --git a/crates/t1-touchbar/src/builtin_renderer.rs b/crates/t1-touchbar/src/builtin_renderer.rs
-index 90cead9..4d49898 100644
+index 90cead9..bdb053b 100644
 --- a/crates/t1-touchbar/src/builtin_renderer.rs
 +++ b/crates/t1-touchbar/src/builtin_renderer.rs
 @@ -18,13 +18,18 @@ use t1_touchbar_hw::wire::{
@@ -1283,7 +1283,7 @@ index 90cead9..4d49898 100644
          }
      }
  }
-@@ -339,6 +369,21 @@ struct RendererSession {
+@@ -339,6 +369,26 @@ struct RendererSession {
      pending_desktop_state: Option<DesktopState>,
      display_off: bool,
      levels: StockLevels,
@@ -1298,6 +1298,11 @@ index 90cead9..4d49898 100644
 +    sampler: Option<SystemSampler>,
 +    system_sampled_at: Option<Duration>,
 +    keyboard_restore: u8,
++    /// Start of the current call (an application recording from the microphone).
++    call_started_at: Option<Duration>,
++    /// Call page closed by the user: not reopened until the call ends.
++    call_dismissed: bool,
++    call_shown_seconds: u32,
 +    touch_context: Option<TouchIdContext>,
 +    touch_misses: u8,
 +    touch_attempt_start: Duration,
@@ -1305,7 +1310,7 @@ index 90cead9..4d49898 100644
      touch_id: TouchIdOverlay,
      overlay_state: Option<OverlayState>,
      overlay_visual_state: Option<OverlayState>,
-@@ -390,6 +435,20 @@ impl RendererSession {
+@@ -390,6 +440,23 @@ impl RendererSession {
              pending_desktop_state: None,
              display_off: false,
              levels: StockLevels::default(),
@@ -1319,6 +1324,9 @@ index 90cead9..4d49898 100644
 +            sampler: None,
 +            system_sampled_at: None,
 +            keyboard_restore: DEFAULT_KEYBOARD_LEVEL,
++            call_started_at: None,
++            call_dismissed: false,
++            call_shown_seconds: 0,
 +            touch_context: None,
 +            touch_misses: 0,
 +            touch_attempt_start: Duration::ZERO,
@@ -1326,7 +1334,7 @@ index 90cead9..4d49898 100644
              touch_id,
              overlay_state: None,
              overlay_visual_state: None,
-@@ -472,6 +531,9 @@ impl RendererSession {
+@@ -472,6 +539,9 @@ impl RendererSession {
                  }
                  let outcome = self.observe_input(frame)?;
                  self.dirty |= outcome.redraw;
@@ -1336,7 +1344,7 @@ index 90cead9..4d49898 100644
                  for action in outcome.actions {
                      self.dispatch(action, connection, provider)?;
                  }
-@@ -636,6 +698,9 @@ impl RendererSession {
+@@ -636,6 +706,9 @@ impl RendererSession {
          }
          match action {
              StockAction::StepDisplayBrightness(direction) => {
@@ -1346,7 +1354,7 @@ index 90cead9..4d49898 100644
                  let feedback = self
                      .desktop_state
                      .capabilities
-@@ -648,6 +713,9 @@ impl RendererSession {
+@@ -648,6 +721,9 @@ impl RendererSession {
                  )
              }
              StockAction::StepKeyboardBacklight(direction) => {
@@ -1356,7 +1364,7 @@ index 90cead9..4d49898 100644
                  let feedback = self
                      .desktop_state
                      .capabilities
-@@ -661,7 +729,7 @@ impl RendererSession {
+@@ -661,7 +737,7 @@ impl RendererSession {
              }
              StockAction::ToggleMute => {
                  self.levels.muted = !self.levels.muted;
@@ -1365,7 +1373,7 @@ index 90cead9..4d49898 100644
                  dispatch_desktop(provider, DesktopAction::ToggleMute);
                  Ok(())
              }
-@@ -672,7 +740,7 @@ impl RendererSession {
+@@ -672,7 +748,7 @@ impl RendererSession {
                      StepDirection::Up => current.saturating_add(VOLUME_STEP_PERCENT).min(100),
                  };
                  self.levels.volume = Some(value);
@@ -1374,7 +1382,7 @@ index 90cead9..4d49898 100644
                  dispatch_desktop(provider, DesktopAction::SetVolume(value));
                  Ok(())
              }
-@@ -681,6 +749,8 @@ impl RendererSession {
+@@ -681,6 +757,8 @@ impl RendererSession {
                  Ok(())
              }
              StockAction::MediaPlayPause => {
@@ -1383,7 +1391,7 @@ index 90cead9..4d49898 100644
                  dispatch_desktop(provider, DesktopAction::MediaPlayPause);
                  Ok(())
              }
-@@ -688,6 +758,81 @@ impl RendererSession {
+@@ -688,6 +766,93 @@ impl RendererSession {
                  dispatch_desktop(provider, DesktopAction::MediaNext);
                  Ok(())
              }
@@ -1401,11 +1409,23 @@ index 90cead9..4d49898 100644
 +                Ok(())
 +            }
 +            StockAction::OpenPage(page) => {
++                if page == Page::Call {
++                    self.call_dismissed = false;
++                }
 +                self.set_page(page);
 +                Ok(())
 +            }
 +            StockAction::ClosePage => {
++                if self.stock.page() == Page::Call {
++                    self.call_dismissed = true;
++                }
 +                self.set_page(Page::Main);
++                Ok(())
++            }
++            StockAction::ToggleCamera => {
++                self.levels.camera_blocked = !self.levels.camera_blocked;
++                self.hold_local_levels();
++                dispatch_desktop(provider, DesktopAction::ToggleCamera);
 +                Ok(())
 +            }
 +            StockAction::SetVolume(value) => {
@@ -1465,15 +1485,16 @@ index 90cead9..4d49898 100644
              StockAction::Escape | StockAction::Function(_) => unreachable!(),
          }
      }
-@@ -745,6 +890,7 @@ impl RendererSession {
+@@ -745,6 +910,8 @@ impl RendererSession {
              self.frame.as_mut_slice().fill(0);
              return Ok(());
          }
 +        let touch_view = (self.overlay_opacity > 0).then(|| self.touch_view()).flatten();
++        let call_seconds = self.call_seconds(self.now);
          let mut frame = Xrgb8888Frame::new(
              self.dimensions.width(),
              self.dimensions.height(),
-@@ -754,7 +900,19 @@ impl RendererSession {
+@@ -754,7 +921,20 @@ impl RendererSession {
          .map_err(|_| BuiltinRendererError::Frame)?;
          let fn_visible = self.input.fn_pressed() && self.overlay_visual_state.is_none();
          self.stock
@@ -1485,6 +1506,7 @@ index 90cead9..4d49898 100644
 +                    display_brightness: self.shown_levels.display_brightness,
 +                    keyboard_backlight: self.shown_levels.keyboard_backlight,
 +                    volume: self.shown_levels.volume,
++                    call_seconds,
 +                    ..self.levels
 +                },
 +                self.input.pressed(),
@@ -1494,7 +1516,7 @@ index 90cead9..4d49898 100644
              .map_err(|_| BuiltinRendererError::Frame)?;
          if self.overlay_opacity > 0 {
              let left = self.stock.escape_right();
-@@ -777,6 +935,9 @@ impl RendererSession {
+@@ -777,6 +957,9 @@ impl RendererSession {
                      .map_err(|_| BuiltinRendererError::Frame)?;
              }
          }
@@ -1504,7 +1526,7 @@ index 90cead9..4d49898 100644
          self.touch_id
              .render_with_progress(
                  &mut frame,
-@@ -793,6 +954,9 @@ impl RendererSession {
+@@ -793,6 +976,9 @@ impl RendererSession {
              return;
          }
          let state_changed = self.overlay_state != state;
@@ -1514,7 +1536,7 @@ index 90cead9..4d49898 100644
          self.overlay_state = state;
          self.enrollment_progress = progress;
          self.enrollment_progress_start = self.enrollment_progress_visual;
-@@ -832,6 +996,11 @@ impl RendererSession {
+@@ -832,6 +1018,12 @@ impl RendererSession {
          self.now = now;
          self.advance_overlay_fade(now);
          self.advance_enrollment_progress(now);
@@ -1522,11 +1544,12 @@ index 90cead9..4d49898 100644
 +        self.advance_touch_timer();
 +        self.advance_gauges(now);
 +        self.advance_page(now);
++        self.advance_call(now);
 +        self.advance_system(now);
          if !self.display_off
              && !self.input.wait_for_touch_release
              && let Some(action) = self.input.take_repeat(now)
-@@ -841,6 +1010,129 @@ impl RendererSession {
+@@ -841,6 +1033,129 @@ impl RendererSession {
          self.submit_if_ready(connection)
      }
  
@@ -1656,7 +1679,7 @@ index 90cead9..4d49898 100644
      fn advance_overlay_fade(&mut self, now: Duration) {
          if self.overlay_opacity == self.overlay_target_opacity {
              return;
-@@ -888,7 +1180,96 @@ impl RendererSession {
+@@ -888,7 +1203,151 @@ impl RendererSession {
          self.dirty = true;
      }
  
@@ -1706,6 +1729,60 @@ index 90cead9..4d49898 100644
 +        }
 +    }
 +
++    /// Follows the call reported by the desktop state: opens the call page when it
++    /// starts (unless dismissed), back to the main page when it ends, and redraws
++    /// the duration once a second. Page changes wait for the finger to lift.
++    fn advance_call(&mut self, now: Duration) {
++        let page = self.stock.page();
++        if self.input.is_idle() {
++            if self.levels.call.is_some() {
++                let replaceable = matches!(page, Page::Main | Page::Volume | Page::Lights | Page::System)
++                    && !(page != Page::Main && now.saturating_sub(self.page_touched_at) < PAGE_TIMEOUT);
++                if !self.call_dismissed && replaceable {
++                    self.set_page(Page::Call);
++                }
++            } else if page == Page::Call {
++                self.set_page(Page::Main);
++            }
++        }
++        if matches!(self.stock.page(), Page::Call | Page::Main) && self.levels.call.is_some() {
++            let seconds = self.call_seconds(now);
++            if seconds != self.call_shown_seconds {
++                self.call_shown_seconds = seconds;
++                self.dirty = true;
++            }
++        }
++    }
++
++    fn call_seconds(&self, now: Duration) -> u32 {
++        self.call_started_at
++            .map_or(0, |start| u32::try_from(now.saturating_sub(start).as_secs()).unwrap_or(u32::MAX))
++    }
++
++    /// Records the start and end of a call from a desktop state.
++    fn note_call(&mut self, call: Option<crate::stock_slice::CallApp>) {
++        match (self.levels.call, call) {
++            (None, Some(_)) => {
++                self.call_started_at = Some(self.now);
++                self.call_dismissed = false;
++            }
++            (Some(_), None) => {
++                self.call_started_at = None;
++                self.call_dismissed = false;
++            }
++            _ => {}
++        }
++        if self.levels.call != call {
++            self.levels.call = call;
++            self.dirty = true;
++        }
++        let stock = self.stock.with_call(call.is_some());
++        if stock != self.stock && self.input.is_idle() {
++            self.stock = stock;
++            self.input.set_stock(stock);
++        }
++    }
++
 +    /// System readings, only while the meter or the system page is on screen.
 +    fn advance_system(&mut self, now: Duration) {
 +        let interval = match self.stock.page() {
@@ -1750,10 +1827,11 @@ index 90cead9..4d49898 100644
 +
      fn set_desktop_state(&mut self, state: DesktopState) -> Result<(), BuiltinRendererError> {
 +        self.sync_app_icons();
++        self.note_call(state.call);
          // Display power follows the desktop immediately, even under an active
          // touch: a dark panel must not keep showing controls.
          if self.display_off != state.display_off {
-@@ -898,12 +1279,13 @@ impl RendererSession {
+@@ -898,12 +1357,13 @@ impl RendererSession {
              }
              self.dirty = true;
          }
@@ -1773,7 +1851,7 @@ index 90cead9..4d49898 100644
              return Ok(());
          }
          if !self.input.is_idle() {
-@@ -930,17 +1312,59 @@ impl RendererSession {
+@@ -930,17 +1390,64 @@ impl RendererSession {
              self.dimensions.height(),
              capabilities,
          )
@@ -1783,7 +1861,8 @@ index 90cead9..4d49898 100644
 +            u8::try_from(self.apps.len()).unwrap_or(u8::MAX),
 +            self.stock.apps_open(),
 +        )
-+        .with_page(self.stock.page());
++        .with_page(self.stock.page())
++        .with_call(self.levels.call.is_some());
          self.stock = stock;
          self.input.set_stock(stock);
 -        self.levels.volume = state.volume;
@@ -1826,6 +1905,10 @@ index 90cead9..4d49898 100644
 +                OutputKind::Usb => AudioOutput::Usb,
 +            }),
 +            effects: state.effects,
++            call: self.levels.call,
++            call_seconds: 0,
++            camera_live: state.camera_live,
++            camera_blocked: state.camera_blocked,
 +        };
 +        if self.levels != levels {
 +            self.levels = levels;
@@ -1836,7 +1919,7 @@ index 90cead9..4d49898 100644
      fn allocate_request(&mut self, kind: PendingRequest) -> Result<u32, BuiltinRendererError> {
          if self.pending.len() >= MAX_PENDING_REQUESTS {
              return Err(BuiltinRendererError::Protocol);
-@@ -960,6 +1384,233 @@ impl RendererSession {
+@@ -960,6 +1467,233 @@ impl RendererSession {
      }
  }
  
@@ -2070,7 +2153,7 @@ index 90cead9..4d49898 100644
  const fn wire_step(direction: StepDirection) -> WireStepDirection {
      match direction {
          StepDirection::Down => WireStepDirection::Down,
-@@ -1150,6 +1801,18 @@ impl InputInterpreter {
+@@ -1150,6 +1884,18 @@ impl InputInterpreter {
              {
                  continue;
              }
@@ -2089,7 +2172,7 @@ index 90cead9..4d49898 100644
              let Some(action) = self.stock.action_for_gesture(gesture, self.fn_pressed) else {
                  continue;
              };
-@@ -1230,7 +1893,20 @@ const fn action_key(action: StockAction) -> Option<KeyCode> {
+@@ -1230,7 +1976,21 @@ const fn action_key(action: StockAction) -> Option<KeyCode> {
          | StockAction::StepVolume(_)
          | StockAction::MediaPrevious
          | StockAction::MediaPlayPause
@@ -2107,11 +2190,12 @@ index 90cead9..4d49898 100644
 +        | StockAction::ToggleEffects
 +        | StockAction::ToggleAutoBrightness
 +        | StockAction::ToggleNightLight
-+        | StockAction::ToggleKeyboardLight => return None,
++        | StockAction::ToggleKeyboardLight
++        | StockAction::ToggleCamera => return None,
      })
  }
  
-@@ -1411,6 +2087,7 @@ mod tests {
+@@ -1411,6 +2171,7 @@ mod tests {
              volume: Some(61),
              muted: true,
              display_off: false,
@@ -2119,7 +2203,7 @@ index 90cead9..4d49898 100644
          };
          session
              .set_desktop_state(state)
-@@ -1454,6 +2131,7 @@ mod tests {
+@@ -1454,6 +2215,7 @@ mod tests {
              volume: Some(42),
              muted: false,
              display_off: false,
@@ -2127,7 +2211,7 @@ index 90cead9..4d49898 100644
          };
          session
              .set_desktop_state(state)
-@@ -1484,6 +2162,7 @@ mod tests {
+@@ -1484,6 +2246,7 @@ mod tests {
              volume: Some(50),
              muted: false,
              display_off: false,
@@ -2135,7 +2219,7 @@ index 90cead9..4d49898 100644
          };
          session
              .set_desktop_state(state)
-@@ -2042,7 +2721,7 @@ mod tests {
+@@ -2042,7 +2805,7 @@ mod tests {
      }
  
      #[test]
@@ -2144,7 +2228,7 @@ index 90cead9..4d49898 100644
          let dimensions = dimensions();
          let stock = StockBar::new(
              dimensions.width(),
-@@ -2051,37 +2730,16 @@ mod tests {
+@@ -2051,37 +2814,16 @@ mod tests {
          )
          .unwrap();
          let mut interpreter = InputInterpreter::new(dimensions, stock).unwrap();
@@ -2287,10 +2371,10 @@ index ea0757c..4e9a63f 100644
  
  #[test]
 diff --git a/crates/t1-touchbar/src/desktop_provider.rs b/crates/t1-touchbar/src/desktop_provider.rs
-index 315fce7..919e188 100644
+index 315fce7..2e9d782 100644
 --- a/crates/t1-touchbar/src/desktop_provider.rs
 +++ b/crates/t1-touchbar/src/desktop_provider.rs
-@@ -64,6 +64,36 @@ pub struct DesktopState {
+@@ -64,6 +64,41 @@ pub struct DesktopState {
      /// True only while a provider advertising display power reports the
      /// desktop display off. An absent or failed provider never blanks.
      pub display_off: bool,
@@ -2314,6 +2398,11 @@ index 315fce7..919e188 100644
 +    pub output_kind: Option<OutputKind>,
 +    /// EasyEffects processing active (`fx=0|1`).
 +    pub effects: Option<bool>,
++    /// Application recording from the microphone (native status only).
++    pub call: Option<crate::stock_slice::CallApp>,
++    /// Virtual camera feeding the real camera; camera cut on purpose.
++    pub camera_live: bool,
++    pub camera_blocked: bool,
 +}
 +
 +/// Where the default sink plays.
@@ -2327,7 +2416,7 @@ index 315fce7..919e188 100644
  }
  
  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-@@ -75,6 +105,17 @@ pub enum DesktopAction {
+@@ -75,6 +110,19 @@ pub enum DesktopAction {
      MediaNext,
      ShowDisplayBrightness,
      ShowKeyboardBacklight,
@@ -2342,10 +2431,12 @@ index 315fce7..919e188 100644
 +    ToggleEffects,
 +    ToggleAutoBrightness,
 +    ToggleNightLight,
++    /// Camera cut on purpose (black frames, real camera off), or back.
++    ToggleCamera,
  }
  
  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-@@ -159,13 +200,20 @@ impl DesktopProvider {
+@@ -159,13 +207,20 @@ impl DesktopProvider {
      /// Starts a worker only for a currently valid provider path.
      #[must_use]
      pub fn start(path: &Path) -> Option<Self> {
@@ -2367,7 +2458,7 @@ index 315fce7..919e188 100644
              .ok()?;
          Some(Self {
              actions,
-@@ -200,10 +248,17 @@ impl DesktopProvider {
+@@ -200,10 +255,17 @@ impl DesktopProvider {
          }
          let action = match action {
              DesktopAction::SetVolume(value) => DesktopAction::SetVolume(value.min(100)),
@@ -2387,7 +2478,7 @@ index 315fce7..919e188 100644
          {
              *pending = action;
          } else if queue.pending.len() < ACTION_QUEUE_CAPACITY {
-@@ -216,6 +271,16 @@ impl DesktopProvider {
+@@ -216,6 +278,16 @@ impl DesktopProvider {
      }
  }
  
@@ -2404,7 +2495,7 @@ index 315fce7..919e188 100644
  impl Drop for DesktopProvider {
      fn drop(&mut self) {
          if let Ok(mut queue) = self.actions.queue.lock() {
-@@ -225,10 +290,24 @@ impl Drop for DesktopProvider {
+@@ -225,10 +297,24 @@ impl Drop for DesktopProvider {
      }
  }
  
@@ -2431,7 +2522,7 @@ index 315fce7..919e188 100644
              report_availability(&mut available, true);
              state
          } else {
-@@ -342,6 +421,33 @@ fn action_arguments(operation: ProviderOperation) -> Vec<OsString> {
+@@ -342,6 +428,36 @@ fn action_arguments(operation: ProviderOperation) -> Vec<OsString> {
          ProviderOperation::Desktop(DesktopAction::ShowKeyboardBacklight) => {
              arguments.push(OsString::from("show-keyboard-backlight"));
          }
@@ -2462,10 +2553,13 @@ index 315fce7..919e188 100644
 +        ProviderOperation::Desktop(DesktopAction::ToggleNightLight) => {
 +            arguments.push(OsString::from("toggle-night-light"));
 +        }
++        ProviderOperation::Desktop(DesktopAction::ToggleCamera) => {
++            arguments.push(OsString::from("toggle-camera"));
++        }
          ProviderOperation::NotifyRendererFallback(reason) => {
              arguments.push(OsString::from("notify-renderer-fallback"));
              arguments.push(OsString::from(match reason {
-@@ -439,9 +545,14 @@ fn finish_status(status: ExitStatus, output: Vec<u8>) -> Result<Vec<u8>, Desktop
+@@ -439,9 +555,14 @@ fn finish_status(status: ExitStatus, output: Vec<u8>) -> Result<Vec<u8>, Desktop
  
  fn parse_status(output: &[u8]) -> Result<DesktopState, DesktopProviderError> {
      let text = std::str::from_utf8(output).map_err(|_| DesktopProviderError::Status)?;
@@ -2482,7 +2576,7 @@ index 315fce7..919e188 100644
              [magic, version, capabilities, volume, muted] => {
                  (*magic, *version, *capabilities, *volume, *muted, None)
              }
-@@ -490,12 +601,54 @@ fn parse_status(output: &[u8]) -> Result<DesktopState, DesktopProviderError> {
+@@ -490,12 +611,54 @@ fn parse_status(output: &[u8]) -> Result<DesktopState, DesktopProviderError> {
          (false, None) => false,
          _ => return Err(DesktopProviderError::Status),
      };
@@ -2539,7 +2633,7 @@ index 315fce7..919e188 100644
  }
  
  fn parse_flag(field: &str) -> Result<bool, DesktopProviderError> {
-@@ -524,6 +677,7 @@ mod tests {
+@@ -524,6 +687,7 @@ mod tests {
                  volume: Some(42),
                  muted: true,
                  display_off: false,
@@ -2547,7 +2641,7 @@ index 315fce7..919e188 100644
              })
          );
          assert_eq!(
-@@ -533,6 +687,7 @@ mod tests {
+@@ -533,6 +697,7 @@ mod tests {
                  volume: None,
                  muted: false,
                  display_off: false,
@@ -2555,7 +2649,7 @@ index 315fce7..919e188 100644
              })
          );
      }
-@@ -546,6 +701,7 @@ mod tests {
+@@ -546,6 +711,7 @@ mod tests {
                  volume: Some(42),
                  muted: false,
                  display_off: true,
@@ -2563,7 +2657,7 @@ index 315fce7..919e188 100644
              })
          );
          assert_eq!(
-@@ -555,6 +711,7 @@ mod tests {
+@@ -555,6 +721,7 @@ mod tests {
                  volume: None,
                  muted: false,
                  display_off: false,
@@ -2571,7 +2665,7 @@ index 315fce7..919e188 100644
              })
          );
          for invalid in [
-@@ -568,6 +725,39 @@ mod tests {
+@@ -568,6 +735,42 @@ mod tests {
          }
      }
  
@@ -2583,6 +2677,9 @@ index 315fce7..919e188 100644
 +                mic_muted: Some(true),
 +                output_kind: Some(OutputKind::Headphones),
 +                effects: Some(false),
++                call: None,
++                camera_live: false,
++                camera_blocked: false,
 +                capabilities: DesktopCapabilities::AUDIO | DesktopCapabilities::DISPLAY_POWER,
 +                volume: Some(42),
 +                muted: false,
@@ -2680,10 +2777,10 @@ index 43722b7..412311c 100644
  pub mod touch_id_overlay;
 diff --git a/crates/t1-touchbar/src/native_status.rs b/crates/t1-touchbar/src/native_status.rs
 new file mode 100644
-index 0000000..5900837
+index 0000000..dda93f1
 --- /dev/null
 +++ b/crates/t1-touchbar/src/native_status.rs
-@@ -0,0 +1,432 @@
+@@ -0,0 +1,527 @@
 +//! Native desktop status for the MacBookPro13,3 (GNOME + PipeWire), replacing the
 +//! provider script's `status` operation that used to be spawned every second.
 +//!
@@ -2694,7 +2791,9 @@ index 0000000..5900837
 +//!   power (Mutter), MPRIS player, Night Light;
 +//! - display and keyboard backlight levels: read from sysfs;
 +//! - GNOME settings (automatic brightness, EasyEffects bypass): read with `gsettings`
-+//!   only when the dconf database file changes.
++//!   only when the dconf database file changes;
++//! - calls: an application recording from the microphone (its stream), and the
++//!   virtual camera state written by `facetime-auto` in `$XDG_RUNTIME_DIR`.
 +//!
 +//! Any missing piece makes [`NativeStatus::status`] return `None`, and the caller
 +//! falls back to the provider script. Actions stay in the script: they only run on
@@ -2717,6 +2816,7 @@ index 0000000..5900837
 +use zbus::zvariant::OwnedValue;
 +
 +use crate::desktop_provider::{DesktopCapabilities, DesktopState, OutputKind};
++use crate::stock_slice::CallApp;
 +
 +const DBUS_TIMEOUT: Duration = Duration::from_millis(300);
 +const PLAYER_LIST_TTL: Duration = Duration::from_secs(5);
@@ -2735,6 +2835,8 @@ index 0000000..5900837
 +    kind: OutputKind,
 +    /// EasyEffects is running (its virtual sink exists).
 +    effects_present: bool,
++    /// Application recording from the microphone.
++    call: Option<CallApp>,
 +}
 +
 +#[derive(Debug, Default)]
@@ -2752,6 +2854,7 @@ index 0000000..5900837
 +    player_checked: Option<Instant>,
 +    settings: SettingsCache,
 +    dconf: PathBuf,
++    runtime: Option<PathBuf>,
 +}
 +
 +impl NativeStatus {
@@ -2781,6 +2884,7 @@ index 0000000..5900837
 +            player_checked: None,
 +            settings: SettingsCache::default(),
 +            dconf: config.join("dconf/user"),
++            runtime: std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
 +        })
 +    }
 +
@@ -2807,6 +2911,12 @@ index 0000000..5900837
 +                .effects_present
 +                .then_some(self.settings.effects_bypassed.map(|bypassed| !bypassed))
 +                .flatten(),
++            call: audio.call,
++            camera_live: self.camera_live(),
++            camera_blocked: self
++                .runtime
++                .as_ref()
++                .is_some_and(|dir| dir.join("facetime-auto.off").exists()),
 +            ..DesktopState::default()
 +        };
 +        if self.player_state(&mut state) {
@@ -2828,6 +2938,14 @@ index 0000000..5900837
 +        proxy
 +            .get(InterfaceName::try_from(interface).ok()?, name)
 +            .ok()
++    }
++
++    /// `facetime-auto` writes `camera` while it feeds the real camera.
++    fn camera_live(&self) -> bool {
++        self.runtime
++            .as_ref()
++            .and_then(|dir| std::fs::read_to_string(dir.join("facetime-auto.state")).ok())
++            .is_some_and(|state| state.trim() == "camera")
 +    }
 +
 +    /// Mutter reports the desktop display powered down (`PowerSaveMode` ≠ 0).
@@ -3019,7 +3137,10 @@ index 0000000..5900837
 +    let mut events = PulseConnection::open("t1-touchbar events")?;
 +    let mut queries = PulseConnection::open("t1-touchbar")?;
 +    events.send(&Command::Subscribe(
-+        SubscriptionMask::SINK | SubscriptionMask::SOURCE | SubscriptionMask::SERVER,
++        SubscriptionMask::SINK
++            | SubscriptionMask::SOURCE
++            | SubscriptionMask::SOURCE_OUTPUT
++            | SubscriptionMask::SERVER,
 +    ))?;
 +    protocol::read_ack_message(&mut events.socket)?;
 +    loop {
@@ -3071,6 +3192,10 @@ index 0000000..5900837
 +            name: Some(CString::new("easyeffects_sink")?),
 +        }))
 +        .is_ok();
++    let call = connection
++        .query::<protocol::SourceOutputInfoList>(&Command::GetSourceOutputInfoList)
++        .ok()
++        .and_then(|outputs| outputs.iter().find_map(call_app));
 +    Ok(AudioState {
 +        volume: u8::try_from((u64::from(volume) * 100 + 0x8000) / 0x1_0000)
 +            .unwrap_or(100)
@@ -3079,7 +3204,60 @@ index 0000000..5900837
 +        mic_muted,
 +        kind: output_kind(&sink),
 +        effects_present,
++        call,
 +    })
++}
++
++fn prop_text(props: &protocol::Props, prop: Prop) -> String {
++    props
++        .get(prop)
++        .map(|bytes| String::from_utf8_lossy(bytes).trim_end_matches('\0').to_owned())
++        .unwrap_or_default()
++}
++
++/// Recording streams that are not calls: level meters, speech, sound effects.
++const NOT_CALLS: [&str; 6] = [
++    "easyeffects",
++    "gnome-control-center",
++    "gnome settings",
++    "pavucontrol",
++    "speech-dispatcher",
++    "t1-touchbar",
++];
++
++/// Application behind a recording stream, `None` for streams that are not calls.
++fn call_app(output: &protocol::SourceOutputInfo) -> Option<CallApp> {
++    let name = prop_text(&output.props, Prop::ApplicationName).to_lowercase();
++    let id = prop_text(&output.props, Prop::ApplicationId).to_lowercase();
++    let binary = prop_text(&output.props, Prop::ApplicationProcessBinary).to_lowercase();
++    let media = prop_text(&output.props, Prop::MediaName);
++    let everything = format!("{name} {id} {binary}");
++    if NOT_CALLS.iter().any(|skip| everything.contains(skip)) {
++        return None;
++    }
++    Some(classify_call(&everything, &media))
++}
++
++/// Call application from the stream's application fields and media (tab) name.
++fn classify_call(application: &str, media: &str) -> CallApp {
++    let media_lower = media.to_lowercase();
++    if media.starts_with("Meet ") || media_lower.contains("google meet") {
++        CallApp::Meet
++    } else if application.contains("talk") || media_lower.contains("nextcloud talk") {
++        CallApp::Talk
++    } else if application.contains("karere") || application.contains("whatsapp") || media_lower.contains("whatsapp") {
++        CallApp::WhatsApp
++    } else if application.contains("teams") || media_lower.contains("teams") {
++        CallApp::Teams
++    } else if application.contains("zoom") || media_lower.contains("zoom") {
++        CallApp::Zoom
++    } else if application.contains("firefox") {
++        CallApp::Firefox
++    } else if application.contains("chrom") {
++        CallApp::Chromium
++    } else {
++        CallApp::Other
++    }
 +}
 +
 +fn output_kind(sink: &protocol::SinkInfo) -> OutputKind {
@@ -3105,6 +3283,20 @@ index 0000000..5900837
 +mod tests {
 +    use super::*;
 +    use zbus::zvariant::Value;
++
++    #[test]
++    fn calls_are_recognised_from_the_stream_fields() {
++        assert_eq!(classify_call("firefox  firefox-esr", "Meet – unx-kgng-cja"), CallApp::Meet);
++        assert_eq!(classify_call("firefox  firefox-esr", "Some page"), CallApp::Firefox);
++        assert_eq!(
++            classify_call("nextcloud talk com.nextcloud.talk nextcloud talk", "WebRTC"),
++            CallApp::Talk
++        );
++        assert_eq!(classify_call("karere  karere", "Playback"), CallApp::WhatsApp);
++        assert_eq!(classify_call("chromium  chromium", "Microsoft Teams"), CallApp::Teams);
++        assert_eq!(classify_call("chromium  chromium", "x"), CallApp::Chromium);
++        assert_eq!(classify_call("obs  obs", "mic"), CallApp::Other);
++    }
 +
 +    #[test]
 +    fn track_length_accepts_signed_and_unsigned_microseconds() {
@@ -5844,7 +6036,7 @@ index 06d714b..ae7644a 100644
      pixels: SUCCESS_PIXELS,
  };
 diff --git a/crates/t1-touchbar/src/stock_art.rs b/crates/t1-touchbar/src/stock_art.rs
-index ad49165..b99cd66 100644
+index ad49165..6eee748 100644
 --- a/crates/t1-touchbar/src/stock_art.rs
 +++ b/crates/t1-touchbar/src/stock_art.rs
 @@ -9,6 +9,8 @@ const SAMPLE_COUNT: u32 = SAMPLE_GRID * SAMPLE_GRID;
@@ -5856,7 +6048,7 @@ index ad49165..b99cd66 100644
  pub(crate) enum Symbol {
      DisplayDown,
      DisplayUp,
-@@ -16,22 +18,125 @@ pub(crate) enum Symbol {
+@@ -16,22 +18,129 @@ pub(crate) enum Symbol {
      KeyboardUp,
      Previous,
      PlayPause,
@@ -5878,6 +6070,10 @@ index ad49165..b99cd66 100644
 +    Effects,
 +    Cpu,
 +    Battery,
++    Call,
++    HangUp,
++    Camera,
++    CameraOff,
  }
  
 -pub(crate) fn draw_rounded_plate(
@@ -5987,7 +6183,7 @@ index ad49165..b99cd66 100644
          let left = radius;
          let right = f64::from(width) - radius;
          let top = radius;
-@@ -44,8 +149,7 @@ pub(crate) fn draw_rounded_plate(
+@@ -44,8 +153,7 @@ pub(crate) fn draw_rounded_plate(
          let dx = x - center_x;
          let dy = y - center_y;
          dx * dx + dy * dy <= radius * radius
@@ -5997,7 +6193,7 @@ index ad49165..b99cd66 100644
  }
  
  pub(crate) fn draw_label(
-@@ -85,6 +189,99 @@ pub(crate) fn draw_label_with_opacity(
+@@ -85,6 +193,99 @@ pub(crate) fn draw_label_with_opacity(
      )
  }
  
@@ -6097,7 +6293,7 @@ index ad49165..b99cd66 100644
  pub(crate) fn draw_symbol(
      frame: &mut Xrgb8888Frame<'_>,
      bounds: Rectangle,
-@@ -98,10 +295,24 @@ pub(crate) fn draw_symbol(
+@@ -98,10 +299,28 @@ pub(crate) fn draw_symbol(
          Symbol::KeyboardUp => stock_icons::KEYBOARD_UP,
          Symbol::Previous => stock_icons::PREVIOUS,
          Symbol::PlayPause => stock_icons::PLAY_PAUSE,
@@ -6119,14 +6315,18 @@ index ad49165..b99cd66 100644
 +        Symbol::Effects => stock_icons::EFFECTS,
 +        Symbol::Cpu => stock_icons::CPU,
 +        Symbol::Battery => stock_icons::BATTERY,
++        Symbol::Call => stock_icons::CALL,
++        Symbol::HangUp => stock_icons::HANG_UP,
++        Symbol::Camera => stock_icons::CAMERA,
++        Symbol::CameraOff => stock_icons::CAMERA_OFF,
      };
      draw_label(frame, bounds, mask, color)
  }
 diff --git a/crates/t1-touchbar/src/stock_icons.rs b/crates/t1-touchbar/src/stock_icons.rs
-index 6e733d7..dec9871 100644
+index 6e733d7..a7f339f 100644
 --- a/crates/t1-touchbar/src/stock_icons.rs
 +++ b/crates/t1-touchbar/src/stock_icons.rs
-@@ -1,433 +1,994 @@
+@@ -1,433 +1,1162 @@
 -//! Generated alpha masks from MIT-licensed Cupertino and Myna icon sources.
 +//! Generated alpha masks: Adwaita symbolic icons (CC BY-SA 3.0) and cairo-drawn
 +//! brightness glyphs, rendered at native Touch Bar size by `touchbar-icons.py`.
@@ -7492,8 +7692,176 @@ index 6e733d7..dec9871 100644
 +    height: 28,
 +    pixels: BATTERY_PIXELS,
 +};
++
++const CALL_PIXELS: &[u8] = &[
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 72, 119, 119, 119, 110, 42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 73, 255, 255, 255, 255, 255, 254, 149, 3, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 128, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 129, 255, 255, 255, 255, 255, 255,
++    255, 244, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 129, 255, 255,
++    255, 255, 255, 255, 255, 255, 51, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 129, 255, 255, 255, 255, 255, 255, 255, 255, 61, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 129, 255, 255, 255, 255, 255, 255, 255, 255, 51, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 123, 255, 255, 255, 255, 255, 255, 255, 255, 35, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 44, 242, 255, 255, 255, 255, 255, 255, 250, 5, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 20, 65, 190, 255, 255, 255,
++    255, 208, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 11,
++    240, 255, 255, 255, 255, 143, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 119, 255, 255, 255, 255, 255, 61, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 30, 240, 255, 255, 255, 255, 219, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 195, 255, 255, 255, 255, 255, 101, 0, 0, 0, 0, 0, 0, 0,
++    72, 119, 119, 119, 119, 119, 116, 43, 0, 0, 0, 0, 7, 174, 255, 255, 255, 255, 255, 213, 5, 0, 0, 0,
++    0, 0, 0, 73, 255, 255, 255, 255, 255, 255, 255, 240, 18, 0, 0, 29, 195, 255, 255, 255, 255, 255, 252, 61,
++    0, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 255, 60, 10, 116, 239, 255, 255, 255, 255,
++    255, 255, 126, 0, 0, 0, 0, 0, 0, 0, 0, 129, 255, 255, 255, 255, 255, 255, 255, 255, 186, 239, 255, 255,
++    255, 255, 255, 255, 255, 164, 1, 0, 0, 0, 0, 0, 0, 0, 0, 129, 255, 255, 255, 255, 255, 255, 255, 255,
++    255, 255, 255, 255, 255, 255, 255, 255, 165, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 112, 255, 255, 255, 255,
++    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 252, 127, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 44,
++    254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 213, 61, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 153, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 220, 102, 5, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 4, 132, 246, 255, 255, 255, 255, 251, 211, 145, 63, 1, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 11, 55, 68, 52, 38, 6, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++];
++
++pub(crate) const CALL: AlphaMask = AlphaMask {
++    width: 28,
++    height: 28,
++    pixels: CALL_PIXELS,
++};
++
++const HANG_UP_PIXELS: &[u8] = &[
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 28, 104, 165, 207, 236, 254, 253, 236, 206, 163, 102, 26,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 74, 188, 253, 255, 255, 255, 255, 255, 255, 255,
++    255, 255, 255, 253, 185, 70, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 47, 195, 255, 255, 255, 255, 255, 255,
++    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 190, 43, 0, 0, 0, 0, 0, 0, 0, 111, 248, 255, 255, 255,
++    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 247, 105, 0, 0, 0, 0, 1, 142, 255,
++    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 146, 2, 0,
++    1, 160, 255, 255, 255, 255, 255, 255, 255, 241, 167, 100, 57, 35, 36, 57, 102, 169, 243, 255, 255, 255, 255, 255,
++    255, 255, 155, 0, 106, 255, 255, 255, 255, 255, 255, 255, 166, 14, 0, 0, 0, 0, 0, 0, 0, 0, 15, 171,
++    255, 255, 255, 255, 255, 255, 255, 98, 214, 255, 255, 255, 255, 255, 255, 255, 244, 49, 0, 0, 0, 0, 0, 0,
++    0, 0, 54, 245, 255, 255, 255, 255, 255, 255, 255, 206, 251, 255, 255, 255, 255, 255, 255, 255, 255, 149, 0, 0,
++    0, 0, 0, 0, 0, 0, 156, 255, 255, 255, 255, 255, 255, 255, 255, 245, 231, 255, 255, 255, 255, 255, 255, 255,
++    255, 88, 0, 0, 0, 0, 0, 0, 0, 0, 95, 255, 255, 255, 255, 255, 255, 255, 255, 223, 145, 255, 255, 255,
++    255, 255, 255, 255, 126, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 130, 255, 255, 255, 255, 255, 255, 255, 137,
++    16, 213, 255, 255, 255, 255, 255, 127, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 132, 255, 255, 255,
++    255, 255, 210, 13, 0, 22, 212, 255, 255, 255, 127, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 129, 255, 255, 255, 215, 25, 0, 0, 0, 24, 192, 241, 116, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 120, 241, 189, 22, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++];
++
++pub(crate) const HANG_UP: AlphaMask = AlphaMask {
++    width: 28,
++    height: 28,
++    pixels: HANG_UP_PIXELS,
++};
++
++const CAMERA_PIXELS: &[u8] = &[
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 12, 109, 172, 187, 187, 187, 187, 187, 187, 187, 187, 187, 187, 187, 172, 108, 11, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 51, 228, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++    255, 227, 50, 0, 255, 171, 4, 0, 0, 0, 0, 26, 234, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++    255, 255, 255, 255, 255, 255, 233, 25, 255, 255, 164, 2, 0, 0, 0, 147, 255, 255, 255, 234, 190, 187, 187, 187,
++    187, 187, 187, 187, 187, 187, 190, 234, 255, 255, 255, 145, 255, 255, 255, 157, 1, 0, 0, 225, 255, 255, 210, 12,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12, 211, 255, 255, 223, 255, 255, 255, 255, 149, 1, 0, 252,
++    255, 255, 134, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 134, 255, 255, 252, 255, 255, 255, 255,
++    255, 144, 0, 255, 255, 255, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255,
++    255, 255, 255, 255, 255, 255, 133, 255, 255, 255, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    128, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 128, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 128, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 255, 255, 238, 255,
++    255, 255, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255,
++    255, 241, 54, 255, 255, 255, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255,
++    255, 255, 255, 255, 245, 63, 0, 255, 255, 255, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    128, 255, 255, 255, 255, 255, 255, 247, 69, 0, 0, 248, 255, 255, 141, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 142, 255, 255, 248, 255, 255, 250, 76, 0, 0, 0, 211, 255, 255, 234, 56, 1, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 1, 56, 235, 255, 255, 209, 255, 252, 84, 0, 0, 0, 0, 118, 255, 255, 255, 255,
++    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 116, 187, 91, 0, 0, 0, 0, 0, 8,
++    203, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 202, 8, 0, 0, 0, 0,
++    0, 0, 0, 0, 17, 173, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 171, 16, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 43, 107, 132, 136, 136, 136, 136, 136, 136, 136, 136, 136, 132, 107,
++    42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++];
++
++pub(crate) const CAMERA: AlphaMask = AlphaMask {
++    width: 28,
++    height: 28,
++    pixels: CAMERA_PIXELS,
++};
++
++const CAMERA_OFF_PIXELS: &[u8] = &[
++    0, 0, 8, 0, 0, 0, 0, 0, 0, 16, 181, 252, 255, 255, 255, 255, 252, 181, 16, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 30, 219, 95, 0, 0, 0, 0, 15, 200, 255, 255, 255, 255, 255, 255, 255, 255, 205, 18,
++    0, 0, 0, 0, 0, 0, 0, 0, 8, 221, 255, 253, 94, 0, 0, 16, 201, 255, 255, 255, 255, 255, 255, 255,
++    255, 255, 255, 201, 16, 0, 0, 0, 0, 0, 0, 0, 0, 94, 253, 255, 253, 139, 119, 203, 255, 255, 255, 234,
++    137, 136, 136, 137, 234, 255, 255, 255, 203, 119, 119, 108, 44, 0, 0, 0, 0, 0, 94, 253, 255, 255, 255, 255,
++    255, 255, 234, 46, 0, 0, 0, 0, 46, 234, 255, 255, 255, 255, 255, 255, 255, 174, 17, 0, 0, 0, 0, 94,
++    253, 255, 255, 255, 255, 235, 46, 0, 0, 0, 0, 0, 0, 46, 235, 255, 255, 255, 255, 255, 255, 255, 203, 8,
++    97, 52, 0, 0, 94, 253, 255, 255, 233, 45, 0, 0, 0, 0, 0, 0, 0, 0, 45, 210, 255, 255, 255, 255,
++    255, 255, 255, 117, 207, 239, 52, 0, 0, 94, 253, 255, 253, 94, 23, 132, 210, 246, 244, 206, 130, 21, 0, 0,
++    0, 0, 1, 56, 234, 255, 255, 209, 245, 255, 239, 50, 0, 0, 94, 253, 255, 253, 242, 255, 255, 255, 255, 255,
++    255, 240, 81, 0, 0, 0, 0, 0, 142, 255, 255, 248, 255, 255, 255, 128, 0, 0, 0, 94, 253, 255, 255, 255,
++    255, 255, 255, 255, 255, 255, 253, 81, 0, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 128, 0, 0, 0, 0,
++    94, 253, 255, 255, 237, 153, 152, 219, 255, 255, 255, 240, 20, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 128,
++    0, 0, 0, 0, 0, 94, 253, 255, 253, 94, 0, 7, 155, 255, 255, 255, 129, 0, 0, 0, 128, 255, 255, 255,
++    255, 255, 255, 128, 0, 0, 0, 32, 0, 0, 94, 253, 255, 253, 94, 0, 7, 220, 255, 255, 206, 0, 0, 0,
++    128, 255, 255, 255, 255, 255, 255, 128, 0, 0, 0, 226, 54, 0, 0, 88, 251, 255, 253, 95, 0, 153, 255, 255,
++    242, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 128, 0, 0, 0, 242, 240, 54, 0, 0, 88, 251, 255, 253,
++    95, 154, 255, 255, 244, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 128, 0, 0, 0, 207, 255, 239, 52, 0,
++    0, 94, 253, 255, 253, 237, 255, 255, 207, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 128, 0, 0, 0, 130,
++    255, 255, 239, 52, 0, 0, 94, 253, 255, 255, 255, 255, 130, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 128,
++    0, 0, 0, 21, 240, 255, 255, 239, 52, 0, 0, 94, 253, 255, 255, 241, 22, 0, 0, 0, 128, 255, 255, 255,
++    255, 255, 255, 128, 0, 0, 0, 0, 81, 253, 255, 255, 239, 52, 0, 0, 94, 253, 255, 253, 94, 0, 0, 0,
++    128, 255, 255, 255, 255, 255, 255, 128, 0, 0, 0, 0, 0, 80, 240, 255, 255, 239, 52, 0, 0, 94, 253, 255,
++    253, 94, 0, 0, 128, 255, 255, 255, 255, 255, 255, 128, 0, 0, 0, 0, 0, 0, 20, 129, 205, 243, 225, 33,
++    0, 0, 94, 253, 255, 253, 94, 0, 128, 255, 255, 255, 243, 255, 255, 158, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 94, 253, 255, 253, 94, 158, 255, 255, 241, 193, 255, 255, 250, 120, 68, 68, 68,
++    68, 68, 68, 68, 68, 68, 68, 68, 68, 34, 0, 0, 94, 253, 255, 253, 250, 255, 255, 190, 85, 255, 255, 255,
++    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 239, 52, 0, 0, 94, 253, 255, 255, 255, 255, 81,
++    0, 155, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 239, 52, 0, 0, 94, 253,
++    255, 255, 187, 0, 0, 1, 110, 232, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 239,
++    52, 0, 0, 94, 253, 255, 221, 8, 0, 0, 0, 3, 42, 66, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68,
++    68, 68, 68, 68, 53, 0, 0, 0, 94, 221, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0,
++];
++
++pub(crate) const CAMERA_OFF: AlphaMask = AlphaMask {
++    width: 28,
++    height: 28,
++    pixels: CAMERA_OFF_PIXELS,
++};
 diff --git a/crates/t1-touchbar/src/stock_slice.rs b/crates/t1-touchbar/src/stock_slice.rs
-index 4c0ae87..4807222 100644
+index 4c0ae87..8e8c20c 100644
 --- a/crates/t1-touchbar/src/stock_slice.rs
 +++ b/crates/t1-touchbar/src/stock_slice.rs
 @@ -4,36 +4,143 @@ use std::{error::Error, fmt};
@@ -7653,7 +8021,7 @@ index 4c0ae87..4807222 100644
  };
  
  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-@@ -90,6 +197,36 @@ pub struct StockLevels {
+@@ -90,6 +197,75 @@ pub struct StockLevels {
      pub keyboard_backlight: Option<u8>,
      pub volume: Option<u8>,
      pub muted: bool,
@@ -7666,6 +8034,43 @@ index 4c0ae87..4807222 100644
 +    pub mic_muted: Option<bool>,
 +    pub output: Option<AudioOutput>,
 +    pub effects: Option<bool>,
++    /// Application recording from the microphone (a call), if any.
++    pub call: Option<CallApp>,
++    /// Call duration shown on the call page.
++    pub call_seconds: u32,
++    /// The virtual camera is feeding the real camera to an application.
++    pub camera_live: bool,
++    /// The camera is cut on purpose (black frames, real camera off).
++    pub camera_blocked: bool,
++}
++
++/// Application recognised from the stream recording the microphone.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum CallApp {
++    Meet,
++    Talk,
++    WhatsApp,
++    Teams,
++    Zoom,
++    Firefox,
++    Chromium,
++    Other,
++}
++
++impl CallApp {
++    #[must_use]
++    pub const fn label(self) -> &'static str {
++        match self {
++            Self::Meet => "Meet",
++            Self::Talk => "Talk",
++            Self::WhatsApp => "WhatsApp",
++            Self::Teams => "Teams",
++            Self::Zoom => "Zoom",
++            Self::Firefox => "Firefox",
++            Self::Chromium => "Chromium",
++            Self::Other => "Appel",
++        }
++    }
 +}
 +
 +/// Kind of the default sink, for the output key of the volume page.
@@ -7687,10 +8092,12 @@ index 4c0ae87..4807222 100644
 +    Lights,
 +    System,
 +    Apps,
++    /// Shown while an application records from the microphone.
++    Call,
  }
  
  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-@@ -103,6 +240,24 @@ pub enum StockAction {
+@@ -103,6 +279,26 @@ pub enum StockAction {
      MediaPrevious,
      MediaPlayPause,
      MediaNext,
@@ -7712,10 +8119,12 @@ index 4c0ae87..4807222 100644
 +    ToggleNightLight,
 +    /// Keyboard backlight off, or back to its previous level.
 +    ToggleKeyboardLight,
++    /// Camera cut on purpose (black frames, real camera off), or back.
++    ToggleCamera,
  }
  
  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-@@ -137,84 +292,108 @@ impl From<FramebufferError> for StockSliceError {
+@@ -137,84 +333,121 @@ impl From<FramebufferError> for StockSliceError {
      }
  }
  
@@ -7753,6 +8162,9 @@ index 4c0ae87..4807222 100644
 +    Memory,
 +    BatteryInfo,
 +    Gpu,
++    CallInfo,
++    CallMic,
++    CallCamera,
  }
  
 +/// Native position of an element; consecutive elements sharing `group` are
@@ -7765,6 +8177,15 @@ index 4c0ae87..4807222 100644
      x: u32,
      width: u32,
 +    group: u8,
++}
++
++const fn slot(item: Item, x: u32, width: u32, group: u8) -> Slot {
++    Slot {
++        item,
++        x,
++        width,
++        group,
++    }
  }
  
 -const NORMAL_CONTROLS: [NativeControl; 10] = [
@@ -7818,15 +8239,6 @@ index 4c0ae87..4807222 100644
 -        x: 1_988,
 -        width: 182,
 -    },
-+const fn slot(item: Item, x: u32, width: u32, group: u8) -> Slot {
-+    Slot {
-+        item,
-+        x,
-+        width,
-+        group,
-+    }
-+}
-+
 +/// Escape, applications, lights, media, system meter, mute and volume.
 +const MAIN_PAGE: [Slot; 9] = [
 +    slot(Item::Apps, APPS_CLOSE_X, APPS_CLOSE_WIDTH, 0),
@@ -7847,8 +8259,8 @@ index 4c0ae87..4807222 100644
 +    slot(Item::Output, 1_446, 260, 3),
 +    slot(Item::Mic, 1_714, 220, 3),
 +    slot(Item::Effects, 1_942, 228, 3),
- ];
- 
++];
++
 +const LIGHTS_PAGE: [Slot; 6] = [
 +    slot(Item::Close, APPS_CLOSE_X, APPS_CLOSE_WIDTH, 0),
 +    slot(Item::DisplaySlider, 278, 720, 1),
@@ -7865,6 +8277,16 @@ index 4c0ae87..4807222 100644
 +    slot(Item::Memory, 1_418, 240, 3),
 +    slot(Item::BatteryInfo, 1_674, 290, 4),
 +    slot(Item::Gpu, 1_980, 190, 5),
+ ];
+ 
++/// Application and duration, microphone and camera, then speaker mute and volume.
++const CALL_PAGE: [Slot; 6] = [
++    slot(Item::Close, APPS_CLOSE_X, APPS_CLOSE_WIDTH, 0),
++    slot(Item::CallInfo, 278, 640, 1),
++    slot(Item::CallMic, 934, 300, 2),
++    slot(Item::CallCamera, 1_242, 300, 2),
++    slot(Item::Mute, 1_558, 140, 3),
++    slot(Item::VolumePill, 1_706, 464, 3),
 +];
 +
 +/// Width kept for the icon at the left of sliders, the meter and labelled keys.
@@ -7886,21 +8308,24 @@ index 4c0ae87..4807222 100644
  }
  
  /// Pure fixed-geometry layout and hit testing for the maintained default.
-@@ -223,6 +402,8 @@ pub struct StockBar {
+@@ -223,6 +456,10 @@ pub struct StockBar {
      width: u32,
      height: u32,
      capabilities: StockCapabilities,
 +    app_count: u8,
 +    page: Page,
++    /// A call is in progress: the main-page meter becomes a way back to the call page.
++    call_active: bool,
  }
  
  impl StockBar {
-@@ -241,10 +422,47 @@ impl StockBar {
+@@ -241,10 +478,57 @@ impl StockBar {
                  width,
                  height,
                  capabilities,
 +                app_count: 0,
 +                page: Page::Main,
++                call_active: false,
              })
          }
      }
@@ -7930,6 +8355,15 @@ index 4c0ae87..4807222 100644
 +        Self { page, ..self }
 +    }
 +
++    /// Same bar knowing whether a call is in progress.
++    #[must_use]
++    pub const fn with_call(self, active: bool) -> Self {
++        Self {
++            call_active: active,
++            ..self
++        }
++    }
++
 +    #[must_use]
 +    pub const fn apps_open(self) -> bool {
 +        matches!(self.page, Page::Apps)
@@ -7943,7 +8377,7 @@ index 4c0ae87..4807222 100644
      #[must_use]
      pub const fn width(self) -> u32 {
          self.width
-@@ -273,17 +491,35 @@ impl StockBar {
+@@ -273,17 +557,35 @@ impl StockBar {
          self.render_pressed(frame, fn_held, levels, None)
      }
  
@@ -7955,11 +8389,11 @@ index 4c0ae87..4807222 100644
      /// Rejects a changed frame geometry or an internally invalid draw.
 -    pub fn render_pressed(
 +    pub fn render_with_apps(
-+        self,
-+        frame: &mut Xrgb8888Frame<'_>,
-+        fn_held: bool,
-+        levels: StockLevels,
-+        pressed: Option<StockAction>,
+         self,
+         frame: &mut Xrgb8888Frame<'_>,
+         fn_held: bool,
+         levels: StockLevels,
+         pressed: Option<StockAction>,
 +        apps: &[AppIcon],
 +    ) -> Result<(), StockSliceError> {
 +        self.render_page(frame, fn_held, levels, pressed, apps, &SystemInfo::default())
@@ -7971,17 +8405,17 @@ index 4c0ae87..4807222 100644
 +    ///
 +    /// Rejects a changed frame geometry or an internally invalid draw.
 +    pub fn render_page(
-         self,
-         frame: &mut Xrgb8888Frame<'_>,
-         fn_held: bool,
-         levels: StockLevels,
-         pressed: Option<StockAction>,
++        self,
++        frame: &mut Xrgb8888Frame<'_>,
++        fn_held: bool,
++        levels: StockLevels,
++        pressed: Option<StockAction>,
 +        apps: &[AppIcon],
 +        system: &SystemInfo,
      ) -> Result<(), StockSliceError> {
          if frame.width() != self.width || frame.height() != self.height {
              return Err(StockSliceError::FrameGeometryMismatch);
-@@ -292,10 +528,25 @@ impl StockBar {
+@@ -292,10 +594,25 @@ impl StockBar {
          if fn_held {
              self.render_function_row(frame, pressed)
          } else {
@@ -8008,7 +8442,7 @@ index 4c0ae87..4807222 100644
      /// Maps a completed tap to one currently visible action.
      #[must_use]
      pub fn action_for_gesture(self, gesture: Gesture, fn_held: bool) -> Option<StockAction> {
-@@ -319,45 +570,665 @@ impl StockBar {
+@@ -319,45 +636,704 @@ impl StockBar {
          if contains(self.escape_bounds(), x, y) {
              return Some(StockAction::Escape);
          }
@@ -8023,9 +8457,7 @@ index 4c0ae87..4807222 100644
 +        }
 +        let item = self
 +            .page_items()
-             .into_iter()
--            .find(|item| self.control_available(item.control) && contains(item.bounds, x, y))
--            .map(|item| control_action(item.control))
++            .into_iter()
 +            .find(|item| contains(item.bounds, x, y))?;
 +        self.item_action(item, x)
 +    }
@@ -8040,7 +8472,9 @@ index 4c0ae87..4807222 100644
 +        let x = display_coordinate(contact.x());
 +        let item = self
 +            .page_items()
-+            .into_iter()
+             .into_iter()
+-            .find(|item| self.control_available(item.control) && contains(item.bounds, x, y))
+-            .map(|item| control_action(item.control))
 +            .find(|item| x >= item.bounds.x && x < item.bounds.x + item.bounds.width)?;
 +        match item.item {
 +            Item::VolumePill => self.item_available(Item::VolumePill).then(|| {
@@ -8064,6 +8498,7 @@ index 4c0ae87..4807222 100644
 +            Item::MediaPrevious => StockAction::MediaPrevious,
 +            Item::MediaPlayPause => StockAction::MediaPlayPause,
 +            Item::MediaNext => StockAction::MediaNext,
++            Item::SystemMeter if self.call_active => StockAction::OpenPage(Page::Call),
 +            Item::SystemMeter => StockAction::OpenPage(Page::System),
 +            Item::Mute => StockAction::ToggleMute,
 +            Item::VolumePill => StockAction::OpenPage(Page::Volume),
@@ -8080,7 +8515,14 @@ index 4c0ae87..4807222 100644
 +                StockAction::SetKeyboardBacklight(self.slider_value(item.bounds, x))
 +            }
 +            Item::KeyboardToggle => StockAction::ToggleKeyboardLight,
-+            Item::CpuGraph | Item::Thermal | Item::Memory | Item::BatteryInfo | Item::Gpu => {
++            Item::CallMic => StockAction::ToggleMic,
++            Item::CallCamera => StockAction::ToggleCamera,
++            Item::CpuGraph
++            | Item::Thermal
++            | Item::Memory
++            | Item::BatteryInfo
++            | Item::Gpu
++            | Item::CallInfo => {
 +                return None;
 +            }
 +        })
@@ -8159,16 +8601,16 @@ index 4c0ae87..4807222 100644
 +                }
 +                self.draw_highlight(frame, *item, levels, pressed)?;
 +                self.draw_item(frame, *item, levels, system)?;
-+            }
-+            if head.item == Item::MediaPrevious
-+                && let Some(progress) = levels.progress
-+            {
-+                self.draw_gauge(frame, capsule, progress, PROGRESS_FILL)?;
              }
 -            let action = control_action(item.control);
 -            self.draw_plate(frame, item.bounds, action, pressed)?;
 -            let symbol = control_symbol(item.control);
 -            stock_art::draw_symbol(frame, item.bounds, symbol, LABEL)?;
++            if head.item == Item::MediaPrevious
++                && let Some(progress) = levels.progress
++            {
++                self.draw_gauge(frame, capsule, progress, PROGRESS_FILL)?;
++            }
 +            start = end;
          }
          Ok(())
@@ -8269,6 +8711,14 @@ index 4c0ae87..4807222 100644
 +                stock_art::draw_symbol(frame, bounds, symbol, LABEL)?;
 +            }
 +            Item::MediaNext => stock_art::draw_symbol(frame, bounds, Symbol::Next, LABEL)?,
++            Item::SystemMeter if levels.call.is_some() => {
++                // during a call the meter shows the call and leads back to its page
++                let app = levels.call.map_or("Appel", CallApp::label);
++                let (minutes, seconds) = (levels.call_seconds / 60, levels.call_seconds % 60);
++                let text = format!("{app} · {minutes}:{seconds:02}");
++                let color = if levels.mic_muted == Some(true) { MUTED_LABEL } else { PROGRESS_FILL };
++                self.draw_icon_and_label(frame, bounds, Symbol::Call, &text, color)?;
++            }
 +            Item::SystemMeter => {
 +                stock_art::draw_symbol(frame, icon_zone, Symbol::Cpu, LABEL)?;
 +                let text_width = self.scaled_x(METER_TEXT_ZONE);
@@ -8410,6 +8860,29 @@ index 4c0ae87..4807222 100644
 +                    },
 +                );
 +                self.draw_icon_and_label(frame, bounds, Symbol::Battery, &text, color)?;
++            }
++            Item::CallInfo => {
++                let app = levels.call.map_or("Appel", CallApp::label);
++                let (minutes, seconds) = (levels.call_seconds / 60, levels.call_seconds % 60);
++                let text = format!("{app} · {minutes}:{seconds:02}");
++                self.draw_icon_and_label(frame, bounds, Symbol::Call, &text, PROGRESS_FILL)?;
++            }
++            Item::CallMic => {
++                let (symbol, text, color) = match levels.mic_muted {
++                    Some(true) => (Symbol::MicOff, "Micro coupé", MUTED_LABEL),
++                    _ => (Symbol::Mic, "Micro", LABEL),
++                };
++                self.draw_icon_and_label(frame, bounds, symbol, text, color)?;
++            }
++            Item::CallCamera => {
++                let (symbol, text, color) = if levels.camera_blocked {
++                    (Symbol::CameraOff, "Caméra coupée", MUTED_LABEL)
++                } else if levels.camera_live {
++                    (Symbol::Camera, "Caméra", PROGRESS_FILL)
++                } else {
++                    (Symbol::Camera, "Caméra", DIM_LABEL)
++                };
++                self.draw_icon_and_label(frame, bounds, symbol, text, color)?;
 +            }
 +            Item::Gpu => {
 +                let level = system.gpu_level.as_deref().unwrap_or("–");
@@ -8690,7 +9163,7 @@ index 4c0ae87..4807222 100644
          }
          Ok(())
      }
-@@ -366,19 +1237,16 @@ impl StockBar {
+@@ -366,19 +1342,16 @@ impl StockBar {
          self,
          frame: &mut Xrgb8888Frame<'_>,
          bounds: Rectangle,
@@ -8717,7 +9190,7 @@ index 4c0ae87..4807222 100644
          Ok(())
      }
  
-@@ -387,23 +1255,71 @@ impl StockBar {
+@@ -387,23 +1360,71 @@ impl StockBar {
              return None;
          }
          let slot = u32::try_from(
@@ -8794,7 +9267,7 @@ index 4c0ae87..4807222 100644
          let inset = self.scaled_x(5).min((right - left) / 2);
          let left_inset = if slot == 0 { 0 } else { inset };
          Rectangle {
-@@ -414,43 +1330,64 @@ impl StockBar {
+@@ -414,43 +1435,68 @@ impl StockBar {
          }
      }
  
@@ -8809,6 +9282,7 @@ index 4c0ae87..4807222 100644
 +            Page::Volume => &VOLUME_PAGE,
 +            Page::Lights => &LIGHTS_PAGE,
 +            Page::System => &SYSTEM_PAGE,
++            Page::Call => &CALL_PAGE,
 +        };
 +        slots
 +            .iter()
@@ -8854,7 +9328,8 @@ index 4c0ae87..4807222 100644
 +            | Item::VolumeSlider
 +            | Item::Output
 +            | Item::Mic
-+            | Item::Effects => self.capabilities.contains(StockCapabilities::AUDIO),
++            | Item::Effects
++            | Item::CallMic => self.capabilities.contains(StockCapabilities::AUDIO),
 +            Item::Apps => self.app_count > 0,
 +            Item::Close
 +            | Item::SystemMeter
@@ -8862,7 +9337,9 @@ index 4c0ae87..4807222 100644
 +            | Item::Thermal
 +            | Item::Memory
 +            | Item::BatteryInfo
-+            | Item::Gpu => true,
++            | Item::Gpu
++            | Item::CallInfo
++            | Item::CallCamera => true,
          }
      }
  
@@ -8880,7 +9357,7 @@ index 4c0ae87..4807222 100644
      }
  
      fn active_right(self) -> u32 {
-@@ -491,36 +1428,36 @@ fn contains(bounds: Rectangle, x: u32, y: u32) -> bool {
+@@ -491,36 +1537,36 @@ fn contains(bounds: Rectangle, x: u32, y: u32) -> bool {
          && y < bounds.y.saturating_add(bounds.height)
  }
  
@@ -8942,7 +9419,7 @@ index 4c0ae87..4807222 100644
  const fn function_action(slot: u32) -> Option<StockAction> {
      Some(match slot {
          0 => StockAction::Escape,
-@@ -606,21 +1543,197 @@ mod tests {
+@@ -606,21 +1652,232 @@ mod tests {
      }
  
      #[test]
@@ -8997,7 +9474,7 @@ index 4c0ae87..4807222 100644
 +        let bar = StockBar::new(NATIVE_WIDTH, NATIVE_HEIGHT, all())
 +            .unwrap()
 +            .with_apps(3, false);
-+        for page in [Page::Main, Page::Volume, Page::Lights, Page::System] {
++        for page in [Page::Main, Page::Volume, Page::Lights, Page::System, Page::Call] {
 +            let items = bar.with_page(page).page_items();
 +            assert!(!items.is_empty());
 +            let mut right = bar.escape_right();
@@ -9051,7 +9528,7 @@ index 4c0ae87..4807222 100644
 +            let bar = bar.unwrap().with_page(page);
 +            assert_eq!(bar.page(), page);
 +            assert_eq!(bar.action_at(at(APPS_CLOSE_X + 10), false), Some(StockAction::ClosePage));
-+        }
+         }
 +        let volume = bar.unwrap().with_page(Page::Volume);
 +        let slider = volume.page_items()[2];
 +        assert_eq!(slider.item, Item::VolumeSlider);
@@ -9105,13 +9582,16 @@ index 4c0ae87..4807222 100644
 +            mic_muted: Some(false),
 +            output: Some(AudioOutput::Speakers),
 +            effects: Some(true),
++            call: Some(CallApp::Meet),
++            call_seconds: 754,
++            camera_live: true,
 +            ..StockLevels::default()
 +        };
 +        let mut system = SystemInfo::default();
 +        for second in 0..HISTORY {
 +            let wave = (second * 37 % 23) as u16 * 4 + if second % 11 == 0 { 180 } else { 8 };
 +            system.cpu_history.push_back(wave);
-         }
++        }
 +        system.temperature_c = Some(54);
 +        system.fan_rpm = Some(2_160);
 +        system.memory_mib = Some((5_222, 15_680));
@@ -9128,6 +9608,7 @@ index 4c0ae87..4807222 100644
 +            ("volume", Page::Volume),
 +            ("lights", Page::Lights),
 +            ("system", Page::System),
++            ("call", Page::Call),
 +        ] {
 +            let mut pixels = vec![0_u8; (NATIVE_WIDTH * NATIVE_HEIGHT * 4) as usize];
 +            let mut frame =
@@ -9144,6 +9625,37 @@ index 4c0ae87..4807222 100644
 +    }
 +
 +    #[test]
++    fn call_page_keys_toggle_microphone_and_camera() {
++        let call = StockBar::new(NATIVE_WIDTH, NATIVE_HEIGHT, all())
++            .unwrap()
++            .with_page(Page::Call);
++        let items = call.page_items();
++        let action = |kind: Item| {
++            let bounds = items.iter().find(|item| item.item == kind).unwrap().bounds;
++            call.action_at(at(bounds.x + bounds.width / 2), false)
++        };
++        assert_eq!(action(Item::Close), Some(StockAction::ClosePage));
++        assert_eq!(action(Item::CallInfo), None);
++        assert_eq!(action(Item::CallMic), Some(StockAction::ToggleMic));
++        assert_eq!(action(Item::CallCamera), Some(StockAction::ToggleCamera));
++        assert_eq!(action(Item::Mute), Some(StockAction::ToggleMute));
++        assert_eq!(action(Item::VolumePill), Some(StockAction::OpenPage(Page::Volume)));
++        // back on the main page, the meter leads to the call page while a call lasts
++        let main = |active: bool| {
++            let bar = StockBar::new(NATIVE_WIDTH, NATIVE_HEIGHT, all()).unwrap().with_call(active);
++            let meter = bar
++                .page_items()
++                .into_iter()
++                .find(|item| item.item == Item::SystemMeter)
++                .unwrap()
++                .bounds;
++            bar.action_at(at(meter.x + meter.width / 2), false)
++        };
++        assert_eq!(main(true), Some(StockAction::OpenPage(Page::Call)));
++        assert_eq!(main(false), Some(StockAction::OpenPage(Page::System)));
++    }
++
++    #[test]
 +    fn cpu_load_shows_a_decimal_below_ten_percent() {
 +        assert_eq!(cpu_text(0), "0,0 %");
 +        assert_eq!(cpu_text(5), "0,5 %");
@@ -9154,7 +9666,7 @@ index 4c0ae87..4807222 100644
      }
  
      #[test]
-@@ -632,20 +1745,16 @@ mod tests {
+@@ -632,20 +1889,16 @@ mod tests {
              StockCapabilities::DISPLAY_BRIGHTNESS | StockCapabilities::KEYBOARD_BACKLIGHT,
          )
          .unwrap();
@@ -9185,7 +9697,7 @@ index 4c0ae87..4807222 100644
          assert_eq!(reduced.action_at(contact, false), None);
      }
  
-@@ -682,7 +1791,7 @@ mod tests {
+@@ -682,7 +1935,7 @@ mod tests {
          assert!(
              normal
                  .iter()

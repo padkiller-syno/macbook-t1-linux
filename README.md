@@ -51,7 +51,8 @@ configurer (projet [t1bridge](https://github.com/standardagents/t1bridge)).
 Touches en capsules, jauges, avancement du morceau et couleurs d'état (lecture,
 muet, casque/Bluetooth, veilleuse…) : rendu maison par un
 [patch de t1bridge](debian13/touchbar/patches/t1bridge-touchbar-pages.patch),
-avec des pages volume, éclairage et système, des curseurs, un vumètre CPU et un
+avec des pages volume, éclairage et système, des curseurs, un vumètre CPU, une
+**page Appel** automatique (micro système, caméra coupée, pour Meet, Talk, WhatsApp…) et un
 état du bureau lu en Rust (~1 % d'un cœur au lieu de 7 %) ; détails dans
 [`debian13/README.md`](debian13/README.md#pages-curseurs-et-état-natif-1611).
 

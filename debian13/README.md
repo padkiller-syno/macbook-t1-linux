@@ -146,6 +146,8 @@ micro** (carte son USB, sans pilote), ou casque **Bluetooth** (profil HFP).
 ⚠️ Quitter puis relancer EasyEffects fait retomber la sortie par défaut sur
 la carte son, qui ne revient pas seule sur « Easy Effects Sink » :
 `wpctl set-default <id>` (le script d'installation le fait).
+Le script relance WirePlumber : les applis audio qui passent par ALSA
+(Plexamp en Flatpak) perdent leur sortie et doivent être relancées.
 
 ## t1-revive — T1 bloquée en recovery
 

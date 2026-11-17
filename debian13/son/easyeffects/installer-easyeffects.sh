@@ -44,3 +44,4 @@ easyeffects -l "MacBook HP"; easyeffects -l "Micro MacBook"
 id=$(pw-dump | python3 -c 'import json,sys;print(next(o["id"] for o in json.load(sys.stdin) if o.get("info",{}).get("props",{}).get("node.name")=="easyeffects_sink"))')
 wpctl set-default "$id"
 echo "OK : préréglages « MacBook HP » (haut-parleurs) et « Micro MacBook » chargés"
+echo "⚠ relancez les applis audio ouvertes qui passent par ALSA (Plexamp…) : elles perdent leur sortie au redémarrage de WirePlumber"

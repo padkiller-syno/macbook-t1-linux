@@ -816,8 +816,11 @@ automatique ignore le réglage et le défait quelques secondes plus tard.
 
 Le rendu d'origine de t1bridge (plaques grises plates, icônes bitmap) est
 remplacé par
-[`t1bridge-touchbar-capsules-jauges.patch`](touchbar/patches/t1bridge-touchbar-capsules-jauges.patch)
-(sur t1bridge `81cbdf8`, appliqué par `install-touchbar.sh`) :
+[`t1bridge-touchbar-pages.patch`](touchbar/patches/t1bridge-touchbar-pages.patch)
+(sur t1bridge `81cbdf8`, appliqué par `install-touchbar.sh` ; il contient aussi
+les pages du 16/11, voir [plus bas](#pages-curseurs-et-état-natif-1611)). La
+disposition décrite ici est celle du 10/11 ; les jauges et couleurs d'état
+restent, réparties sur les pages :
 
 - **groupes** : touches regroupées par fonction (luminosité, clavier, média,
   volume) dans une même plaque, séparateurs fins, touche enfoncée plus claire ;
@@ -876,14 +879,57 @@ au repos, 5 ms dès qu'il y a une image à envoyer, un appui ou une répétition
 un fondu, une jauge qui glisse ou un écran Touch ID. Un appui ou un accusé
 réception réveille la boucle aussitôt. Mesure : 2,2 % → 0,8 % d'un cœur.
 
+### Pages, curseurs et état natif (16/11)
+
+![Pages de la Touch Bar](touchbar/apercu-pages.png)
+
+- **barre principale** : esc, grille des applications, éclairage (écran et
+  clavier, avec leurs jauges), média resserré, **vumètre CPU** (historique de la
+  charge sur une échelle racine carrée, valeur au dixième sous 10 % et
+  température), sourdine, volume ;
+- un **appui** sur l'éclairage, le vumètre ou le volume ouvre sa **page** ; un
+  **glissement** sur la touche volume règle le volume directement ; × ou 6 s
+  sans toucher ramènent la barre principale ;
+- **volume** : curseur, sortie par défaut (bascule entre les sorties
+  matérielles, EasyEffects exclu), coupure du micro, EasyEffects (contournement
+  global) ;
+- **éclairage** : curseurs écran et clavier (valeurs absolues via gsd-power, la
+  luminosité automatique reste cohérente), luminosité auto, veilleuse, clavier
+  éteint / rallumé à son niveau précédent ;
+- **système** : charge CPU, température et ventilateur, mémoire, batterie
+  (% et watts), mode et puissance de la Radeon, lus **en Rust** dans `/proc` et
+  `/sys` (`system_info.rs`), seulement quand le vumètre ou la page est affiché ;
+- **état du bureau lu par le renderer** (`native_status.rs`, crates `pulseaudio`
+  et `zbus`) : abonnement aux événements de `pipewire-pulse` (volume, sortie,
+  micro), connexion D-Bus permanente (Mutter, MPRIS, veilleuse), réglages GNOME
+  relus seulement quand dconf change. Le script du fournisseur ne sert plus
+  qu'aux actions et en secours (`T1BRIDGE_NATIVE_STATUS=0` pour y revenir,
+  `T1_NATIVE_DEBUG=1` pour tracer les événements son) ;
+- masques des plaques arrondies mis en cache (la barre est redessinée par le
+  vumètre).
+
+Consommation (% d'un cœur, renderer + script du fournisseur) :
+
+| Version | Renderer | Script | Total |
+|---|---|---|---|
+| capsules du 13/11 | 0,33 | 6,6 | 6,9 |
+| pages, état lu par le script | 0,88 | 6,75 | 7,6 |
+| **pages, état natif** | **1,07** | **0** | **1,1** |
+
+Installation : `cargo build --release -p t1-touchbar` dans t1bridge patché, puis
+[`touchbar/installer-renderer.sh`](touchbar/installer-renderer.sh) (binaire épuré,
+fournisseur, redémarrage du service ; `annuler` pour revenir en arrière).
+Aperçu des pages sans la Touch Bar :
+`T1_PREVIEW_DIR=/tmp cargo test -p t1-touchbar preview_pages -- --ignored`.
+
 ### Panneau d'applications
 
 La touche **grille** est dans la **rangée Fn**, juste après esc (fn maintenue :
 esc, grille, F1…F12 sur 14 touches ; sans application configurée, la rangée Fn
 reste à 13 touches). Un appui ouvre la page d'icônes en couleur, affichée une
 fois fn relâchée : esc, **×** pour refermer, puis les applications ; un appui
-sur une icône lance l'application et ramène la page normale. La rangée normale
-garde sa disposition (esc large, contrôles de 182 px).
+sur une icône lance l'application et ramène la page normale. Depuis le 16/11,
+la touche grille est aussi sur la barre principale, juste après esc.
 
 - liste : [`apps.conf`](touchbar/desktop-provider/apps.conf) →
   `~/.config/t1bridge/apps.conf`, un identifiant `.desktop` par ligne (Flatpak

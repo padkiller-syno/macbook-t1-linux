@@ -27,8 +27,8 @@ echo "== 1/6 dépendance de compilation"
 apt-get install -y libsystemd-dev
 
 echo "== 2/6 compilation du service matériel (en tant que $U)"
-# look capsules + jauges (patches/t1bridge-touchbar-capsules-jauges.patch), sauf s'il est déjà appliqué
-P=$(cd "$(dirname "$0")" && pwd)/patches/t1bridge-touchbar-capsules-jauges.patch
+# capsules, jauges, pages, curseurs, état natif (patches/t1bridge-touchbar-pages.patch), sauf s'il est déjà appliqué
+P=$(cd "$(dirname "$0")" && pwd)/patches/t1bridge-touchbar-pages.patch
 if [ -f "$P" ] && ! sudo -u $U git -C $H/t1bridge apply --reverse --check "$P" 2>/dev/null; then
   sudo -u $U git -C $H/t1bridge apply "$P"
 fi

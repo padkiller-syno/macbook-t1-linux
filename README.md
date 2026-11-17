@@ -27,7 +27,7 @@ configurer (projet [t1bridge](https://github.com/standardagents/t1bridge)).
 | Chantier | Statut | Dossier |
 |---|---|---|
 | **Wi-Fi** BCM43602 (5 GHz, signal) | ✅ -55 dBm en 5 GHz (contre -89 dBm en 2,4 GHz avant) | [`wifi/`](debian13/wifi/) |
-| **Son** CS8409 (haut-parleurs + micro interne) | ✅ — ❌ micro du casque jack non pris en charge | [`son/`](debian13/son/) |
+| **Son** CS8409 (haut-parleurs + micro interne) | ✅ + préréglages EasyEffects (basses, micro débruité, volume corrigé) — ❌ micro du casque jack non pris en charge | [`son/`](debian13/son/) |
 | **T1 en recovery** (`05ac:1281`) | ✅ régénérée avec t1-revive | [`t1-revive/`](debian13/README.md#t1-revive-t1-bloquée-en-recovery) |
 | **Noyau 7.2** (trixie-backports) | ✅ par défaut, 6.12 en secours ; tous les modules sous DKMS pour les deux | [`noyau-7.2/`](debian13/README.md#noyau-72-trixie-backports) |
 | **Touch Bar** | ✅ (t1bridge : modules portés en 6.12, d'origine en 7.2), allumée dès l'écran de connexion | [`touchbar/`](debian13/touchbar/) |

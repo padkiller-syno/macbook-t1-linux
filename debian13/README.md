@@ -14,7 +14,7 @@ GNOME 48 / **Wayland**, LUKS + LVM. Session de remise en état du 20/10/2026.
 | Chantier | Statut | Dossier |
 |---|---|---|
 | **Wi-Fi** BCM43602 (5 GHz, signal) | ✅ -55 dBm en 5 GHz (contre -89 dBm en 2,4 GHz avant) | [`wifi/`](wifi/) |
-| **Son** CS8409 (haut-parleurs + micro interne) | ✅ — ❌ micro du casque jack non pris en charge | [`son/`](son/) |
+| **Son** CS8409 (haut-parleurs + micro interne) | ✅ + préréglages EasyEffects (basses, micro débruité) — ❌ micro du casque jack non pris en charge | [`son/`](son/) |
 | **T1 en recovery** (`05ac:1281`) | ✅ régénérée avec t1-revive | [`t1-revive/`](#t1-revive-t1-bloquée-en-recovery) |
 | **Noyau 7.2** (trixie-backports) | ✅ par défaut, 6.12 en secours ; tous les modules sous DKMS pour les deux | [`noyau-7.2/`](#noyau-72-trixie-backports) |
 | **Touch Bar** | ✅ (t1bridge : modules portés en 6.12, d'origine en 7.2), allumée dès l'écran de connexion | [`touchbar/`](touchbar/) |
@@ -119,6 +119,33 @@ déclic.
 
 Pour un micro de casque : casque **USB** ou adaptateur **USB-C → jack avec
 micro** (carte son USB, sans pilote), ou casque **Bluetooth** (profil HFP).
+
+### EasyEffects : haut-parleurs, micro débruité, volume
+
+`son/easyeffects/installer-easyeffects.sh` (en utilisateur, après
+`sudo apt install easyeffects lsp-plugins-lv2 calf-plugins`) installe :
+
+- **« MacBook HP »** (sortie), chargé seulement sur la route
+  `analog-output-speaker` (pas au casque) : Bass Enhancer calf (harmoniques
+  des graves sous 160 Hz, que l'oreille rattache à la note) → égaliseur LSP
+  (passe-haut 90 Hz pour ne pas forcer les haut-parleurs, +6,5 dB à 170 Hz,
+  −2,5 dB à 480 Hz, +1,5 dB à 3,2 kHz, +3 dB au-dessus de 9 kHz) → limiteur
+  (+6 dB, seuil −1 dB). Réglé à l'oreille, sans mesure.
+- **« Micro MacBook »** (entrée) : débruitage **DeepFilterNet**. Le paquet
+  Debian d'EasyEffects 7.2 est compilé sans RNNoise ni DeepFilterNet
+  (« Enlèvement du bruit profond indisponible ») : le script télécharge le
+  plugin officiel v0.5.6 dans `~/.ladspa` (SHA-256 vérifié) et ajoute ce
+  dossier à `LADSPA_PATH` (`~/.config/environment.d/60-ladspa.conf`).
+  ~7 % d'un cœur micro ouvert.
+- **Correctif du volume** : EasyEffects crée sa sortie avec
+  `monitor.passthrough = true` → le volume (touches, GNOME, Touch Bar) ne
+  s'applique pas au son traité. Un script WirePlumber
+  (`ee-sink-volume.lua`) repasse `monitor.passthrough = false` et
+  `monitor.channel-volumes = true` à chaque apparition de la sortie.
+
+⚠️ Quitter puis relancer EasyEffects fait retomber la sortie par défaut sur
+la carte son, qui ne revient pas seule sur « Easy Effects Sink » :
+`wpctl set-default <id>` (le script d'installation le fait).
 
 ## t1-revive — T1 bloquée en recovery
 

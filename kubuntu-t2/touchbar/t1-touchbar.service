@@ -1,0 +1,16 @@
+[Unit]
+Description=T1Bridge Touch Bar renderer (MacBook Pro T2, KDE)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+Environment=T1BRIDGE_DESKTOP_PROVIDER=%h/.local/bin/t1-desktop-provider
+ExecStart=/usr/local/lib/t1bridge/t1-touchbar
+UMask=0077
+NoNewPrivileges=yes
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

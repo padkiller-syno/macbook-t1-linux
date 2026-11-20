@@ -4,8 +4,21 @@
 Window.SetBackgroundTopColor(0, 0, 0);
 Window.SetBackgroundBottomColor(0, 0, 0);
 
-W = Window.GetWidth();
-H = Window.GetHeight();
+# Window.GetWidth() sans indice = plus petite largeur de tous les écrans : avec la Touch Bar vue comme écran
+# (appletbdrm, 60x2170 sur le T2), tout se centrait sur 60 px, au bord gauche. On prend le plus grand écran
+# et on place tout par rapport à son origine (X0, Y0).
+grand = 0;
+surface = 0;
+for (i = 0; i < 8; i++) {
+  if (Window.GetWidth(i) * Window.GetHeight(i) > surface) {
+    surface = Window.GetWidth(i) * Window.GetHeight(i);
+    grand = i;
+  }
+}
+W = Window.GetWidth(grand);
+H = Window.GetHeight(grand);
+X0 = Window.GetX(grand);
+Y0 = Window.GetY(grand);
 k = H / 1800;
 
 fun echelle(img) {
@@ -13,12 +26,12 @@ fun echelle(img) {
 }
 
 fun centrer_x(img) {
-  return Math.Int((W - img.GetWidth()) / 2);
+  return X0 + Math.Int((W - img.GetWidth()) / 2);
 }
 
 # Pomme, légèrement au-dessus du centre
 logo.image = echelle(Image("pomme.png"));
-logo.y = Math.Int(H / 2 - logo.image.GetHeight() * 0.8);
+logo.y = Y0 + Math.Int(H / 2 - logo.image.GetHeight() * 0.8);
 logo.sprite = Sprite(logo.image);
 logo.sprite.SetPosition(centrer_x(logo.image), logo.y, 1);
 

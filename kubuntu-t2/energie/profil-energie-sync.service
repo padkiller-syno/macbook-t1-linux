@@ -1,0 +1,12 @@
+[Unit]
+Description=Profil d'énergie -> CPU (plafond, turbo, EPP) et Radeon (low / auto)
+After=dbus.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/profil-energie-sync
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

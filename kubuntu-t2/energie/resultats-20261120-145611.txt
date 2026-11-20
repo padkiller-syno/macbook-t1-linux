@@ -1,0 +1,5 @@
+# Mesure énergie 2026-11-20 14:56:13 — 7.3.5-1-t2-resolute — MacBookPro15,1
+# luminosité=30147/65535  batterie=96%
+# repos : moyenne sur 30 s ; tâche : xz -T0 -6 sur 256 Mo
+réglage                     |  repos W    CPU W Radeon W | tâche s  tâche J     CPU J  MHz moy
+2200:balance_power           |     0.00     4.69     7.74 |    21.1         0     489.7     2078

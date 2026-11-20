@@ -1,0 +1,54 @@
+#!/bin/bash
+# MacBook Pro T2 : invite Touch ID sur la Touch Bar t1bridge (comme sur le 2016).
+# Sur la T1, l'état est écrit par le démon Touch ID de t1bridge ; sur le T2 l'empreinte passe par fprintd
+# (t2-touchid, périphérique virtuel). Ce démon suit fprintd sur le bus système et écrit le même fichier
+# /run/t1bridge/touch-id-state.json ({"version":1,"pid":…,"state":"authenticate|retry|success"}),
+# que le renderer lit déjà ; le texte (commande sudo, déverrouillage…) vient de touchid-context (pam_exec).
+# Événements vus le 20/11 : VerifyFingerSelected, finger-needed true/false, VerifyStatus (verify-match, true),
+# (verify-retry-scan, false) pour un mauvais doigt, puis finger-needed repasse à true.
+# Installé dans /usr/local/lib/t1bridge/, lancé par fprintd-touchbar-overlay.service.
+set -u
+DIR=/run/t1bridge
+OUT=$DIR/touch-id-state.json
+state=""       # dernier état écrit
+retry_at=0     # instant (ms) du dernier « retry », pour le laisser visible un moment
+
+now_ms() { local s=${EPOCHREALTIME/./}; echo $(( s / 1000 )); }
+
+write() {  # write <authenticate|retry|success>
+  [ -d "$DIR" ] || return 0
+  local tmp=$OUT.$$
+  printf '{"version":1,"pid":%d,"state":"%s"}\n' $$ "$1" >"$tmp" && chgrp t1bridge "$tmp" && chmod 640 "$tmp" \
+    && mv -f "$tmp" "$OUT" && state=$1
+  rm -f "$tmp"
+}
+
+clear() { rm -f "$OUT"; state=""; }
+
+trap 'clear; exit 0' TERM INT
+clear
+while IFS= read -r line; do
+  case "$line" in
+    *"'finger-needed': <true>"*)
+      if [ "$state" = retry ]; then   # « essai raté » visible au moins 0,7 s
+        wait=$(( 700 - ($(now_ms) - retry_at) )); [ $wait -gt 0 ] && sleep "0.$(printf '%03d' $wait)"
+      fi
+      write authenticate ;;
+    *"VerifyStatus ('verify-match'"*)
+      write success ;;
+    *"VerifyStatus ('verify-no-match', false)"*|*"VerifyStatus ('verify-retry-scan'"*|*"VerifyStatus ('verify-swipe-too-short'"*|\
+    *"VerifyStatus ('verify-finger-not-centered'"*|*"VerifyStatus ('verify-remove-and-retry'"*)
+      write retry; retry_at=$(now_ms) ;;
+    *"VerifyStatus ("*", true)"*)   # fin sans succès (non reconnu, délai, erreur)
+      write retry; sleep 0.7; clear ;;
+    *"'finger-needed': <false>"*)
+      case "$state" in
+        success) sleep 0.8; clear ;;   # laisse voir la coche verte
+        retry) ;;                       # l'attente reprend aussitôt (finger-needed true) ou VerifyStatus final
+        *) clear ;;
+      esac ;;
+    *"does not have an owner"*) clear ;;
+  esac
+done < <(stdbuf -oL gdbus monitor --system --dest net.reactivated.Fprint 2>/dev/null)
+clear
+exit 1   # gdbus arrêté : systemd relance

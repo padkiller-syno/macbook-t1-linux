@@ -1,0 +1,19 @@
+#!/bin/sh
+# Crochet de veille t1bridge Touch Bar (MacBook Pro T2, essai) : /usr/lib/systemd/system-sleep/t1bridge-touchbar
+# Au réveil, le T2 réinitialise le tactile : t1-touchbar-hw sortait en erreur et systemd le relançait
+# pendant une éventuelle remise en veille. On l'arrête donc proprement avant et on le relance après,
+# seulement s'il tournait.
+FLAG=/run/t1bridge-touchbar-relancer
+case "$1" in
+  pre)
+    if systemctl -q is-active t1-touchbar-hw.service || systemctl -q is-active t1-touchbar-hw.socket; then
+      : > "$FLAG"
+      systemctl stop t1-touchbar-hw.socket t1-touchbar-hw.service
+    fi ;;
+  post)
+    if [ -e "$FLAG" ]; then
+      rm -f "$FLAG"
+      systemctl --no-block start t1-touchbar-hw.socket t1-touchbar-hw.service
+    fi ;;
+esac
+exit 0

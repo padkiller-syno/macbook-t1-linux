@@ -1,0 +1,12 @@
+# Mesure énergie 2026-11-20 14:58:36 — 7.3.5-1-t2-resolute — MacBookPro15,1
+# luminosité=30147/65535  batterie=96%
+# repos : moyenne sur 30 s ; tâche : xz -T0 -6 sur 256 Mo
+réglage                     |  repos W    CPU W Radeon W | tâche s  tâche J     CPU J  MHz moy
+1200:power                   |    21.92     4.64     8.18 |    36.9      1198     433.6     1163
+1600:balance_power           |    22.37     5.01     8.18 |    28.6      1060     446.1     1526
+2200:balance_power           |    22.68     5.04     8.37 |    21.3       979     500.9     2083
+2200:balance_performance     |    22.39     4.73     8.41 |    20.8       962     489.9     2070
+3000:balance_power           |    22.68     5.06     8.42 |    16.3      1080     637.2     2784
+3000:balance_performance     |    22.71     4.78     8.61 |    16.1      1023     638.9     2896
+turbo:balance_performance    |    22.33     5.08     8.58 |    15.2      1118     744.6     3143
+turbo:performance            |    25.53     6.63     8.68 |    15.0      1186     771.9     3208

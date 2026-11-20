@@ -1,0 +1,153 @@
+#!/bin/bash
+# Fournisseur bureau t1bridge (contrat « Desktop provider v1 ») pour KDE Plasma 6 + PipeWire,
+# MacBook Pro T2 (MacBookPro15,1, Kubuntu). Pendant de ~/.local/bin/t1-desktop-provider du 2016 (GNOME).
+# Installé sur le T2 dans ~/.local/bin/t1-desktop-provider.
+# L'état est lu par le renderer lui-même (native_status.rs) ; `status` ne sert qu'en secours.
+# Appelé par t1-touchbar avec : v1 <opération> [argument]   (délai max 500 ms)
+#  - volume / micro / sortie : wpctl (PipeWire)
+#  - luminosité écran : PowerDevil (org.kde.ScreenBrightness), pour que Plasma reste d'accord
+#  - clavier : PowerDevil (KeyboardBrightnessControl)
+#  - veilleuse : KWin Night Color (kwinrc + reconfigure)
+#  - média : MPRIS ; profils : power-profiles-daemon
+set -u
+export LC_ALL=C
+SINK=@DEFAULT_AUDIO_SINK@
+DISPLAY_BL=/sys/class/backlight/gmux_backlight
+KBD_LED=$(ls -d /sys/class/leds/*kbd_backlight 2>/dev/null | head -n1)
+PD=org.kde.Solid.PowerManagement
+KBD_PATH=/org/kde/Solid/PowerManagement/Actions/KeyboardBrightnessControl
+KBD_IFACE=org.kde.Solid.PowerManagement.Actions.KeyboardBrightnessControl
+SB=org.kde.ScreenBrightness
+
+player() {  # premier lecteur MPRIS présent sur le bus de session
+  local names
+  names=$(busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus ListNames 2>/dev/null)
+  [[ $names =~ \"(org\.mpris\.MediaPlayer2\.[^\"]*)\" ]] && echo "${BASH_REMATCH[1]}"
+}
+
+mpris() {  # mpris <Méthode>
+  local p; p=$(player); [ -n "$p" ] || exit 1
+  busctl --user call "$p" /org/mpris/MediaPlayer2 org.mpris.MediaPlayer2.Player "$1" >/dev/null
+}
+
+percent() {  # percent <dossier backlight|leds> → PCT (vide si illisible)
+  local b m; PCT=""
+  read -r b <"$1/brightness" 2>/dev/null && read -r m <"$1/max_brightness" 2>/dev/null || return 0
+  [ "$m" -gt 0 ] && PCT=$(( (b * 100 + m / 2) / m ))
+  return 0
+}
+
+internal_display() {  # objet D-Bus de l'écran interne chez PowerDevil (display0 en général)
+  local d
+  for d in $(busctl --user get-property $SB /org/kde/ScreenBrightness $SB DisplaysDBusNames 2>/dev/null | grep -o '"[^"]*"' | tr -d '"'); do
+    [ "$(busctl --user get-property $SB /org/kde/ScreenBrightness/$d $SB.Display IsInternal 2>/dev/null)" = "b true" ] \
+      && { echo "$d"; return; }
+  done
+}
+
+set_display() {  # set_display <pourcentage> [flags] : flags 1 = sans bulle Plasma
+  local d max
+  d=$(internal_display); [ -n "$d" ] || return 1
+  max=$(busctl --user get-property $SB /org/kde/ScreenBrightness/$d $SB.Display MaxBrightness 2>/dev/null)
+  max=${max#i }; [[ $max =~ ^[0-9]+$ ]] || return 1
+  busctl --user call $SB /org/kde/ScreenBrightness/$d $SB.Display SetBrightness iu $(( $1 * max / 100 )) "${2:-1}" >/dev/null
+}
+
+set_keyboard() {  # set_keyboard <pourcentage>
+  # Après une veille, la LED du clavier est recréée et PowerDevil garde l'ancienne (réglage sans effet,
+  # keyboardBrightness = 0) : on écrit donc par logind (même chemin que les pas de luminosité de la
+  # Touch Bar), puis on prévient PowerDevil sans bulle, au mieux.
+  local max led value
+  [ -n "$KBD_LED" ] || return 1
+  led=${KBD_LED##*/}
+  read -r max <"$KBD_LED/max_brightness" 2>/dev/null; [[ ${max:-} =~ ^[0-9]+$ ]] || return 1
+  value=$(( ($1 * max + 50) / 100 ))
+  busctl call org.freedesktop.login1 /org/freedesktop/login1/session/auto org.freedesktop.login1.Session \
+    SetBrightness ssu leds "$led" "$value" >/dev/null || return 1
+  busctl --user call $PD $KBD_PATH $KBD_IFACE setKeyboardBrightnessSilent i "$value" >/dev/null 2>&1 || true
+}
+
+status() {  # secours seulement (T1BRIDGE_NATIVE_STATUS=0 ou PipeWire/D-Bus indisponibles)
+  local caps=$((1 + 8 + 16)) v num int frac vol muted=0 extras=""
+  v=$(wpctl get-volume $SINK 2>/dev/null) || exit 1   # « Volume: 0.23 [MUTED] »
+  num=${v#Volume: }; num=${num%% *}; int=${num%%.*}; frac=${num#*.}00; frac=${frac:0:2}
+  vol=$(( 10#$int * 100 + 10#$frac )); [ $vol -gt 100 ] && vol=100
+  [[ $v == *MUTED* ]] && muted=1
+  percent $DISPLAY_BL; [ -n "$PCT" ] && extras+=" disp=$PCT"
+  [ -n "$KBD_LED" ] && { percent "$KBD_LED"; [ -n "$PCT" ] && extras+=" kbd=$PCT"; }
+  echo "T1BRIDGE-DESKTOP 1 $caps $vol $muted 1$extras"
+}
+
+cycle_output() {  # sortie suivante parmi les sorties de pactl (EasyEffects exclu). Sur le T2, `wpctl status`
+  # ne marque pas la sortie par défaut : c'est le filtre DSP des haut-parleurs (apple-t2-audio-config).
+  local sinks=() current name i next
+  current=$(pactl get-default-sink 2>/dev/null)
+  # sorties dont le port actif est disponible (casque sans prise = « not available » : WirePlumber
+  # le refuserait et reviendrait sur la sortie précédente, le cycle resterait bloqué)
+  while read -r name; do
+    [[ $name == easyeffects* ]] && continue
+    sinks+=("$name")
+  done < <(LC_ALL=C pactl list sinks 2>/dev/null | awk '
+    /^Sink #/ { if (n != "" && !bad[active]) print n; n = ""; active = ""; delete bad }
+    /^\tName: / { n = $2 }
+    /^\t\t\[?[^:]*: .*not available\)$/ { p = $0; sub(/^\t\t/, "", p); sub(/: .*/, "", p); bad[p] = 1 }
+    /^\tActive Port: / { active = $0; sub(/^\tActive Port: /, "", active) }
+    END { if (n != "" && !bad[active]) print n }')
+  [ ${#sinks[@]} -gt 1 ] || return 0
+  next=${sinks[0]}
+  for i in "${!sinks[@]}"; do [ "${sinks[$i]}" = "$current" ] && next=${sinks[$(( (i + 1) % ${#sinks[@]} ))]}; done
+  pactl set-default-sink "$next"
+}
+
+toggle_night_color() {  # KWin 6.6 : clé NightColor/Active de kwinrc ; --notify = KWin la relit aussitôt
+  # (sans --notify, ni `reconfigure` ni rien d'autre ne la fait relire). État lu sur org.kde.KWin.NightLight.
+  local next=true
+  [ "$(busctl --user get-property org.kde.KWin /org/kde/KWin/NightLight org.kde.KWin.NightLight enabled 2>/dev/null)" = "b true" ] && next=false
+  LC_ALL=C.UTF-8 kwriteconfig6 --notify --file kwinrc --group NightColor --key Active "$next" 2>/dev/null
+}
+
+# Trace des actions (pas de `status`) : $XDG_RUNTIME_DIR/t1-desktop-provider.log
+[ "${2:-}" != status ] && trap 'echo "$(date +%T) ${*} rc=$?" >>"${XDG_RUNTIME_DIR:-/tmp}/t1-desktop-provider.log"' EXIT
+[ "${1:-}" = v1 ] || exit 2
+case "${2:-}" in
+  status) status ;;
+  set-volume)
+    [[ ${3:-} =~ ^[0-9]+$ ]] && [ "$3" -le 100 ] || exit 2
+    wpctl set-volume $SINK "$3%" ;;
+  toggle-mute)       wpctl set-mute $SINK toggle ;;
+  show-display-brightness)   # la Touch Bar a réglé l'écran via logind : recaler PowerDevil sans bulle
+    percent $DISPLAY_BL; [ -n "$PCT" ] && set_display "$PCT" 1 ;;
+  show-keyboard-backlight) ;;
+  media-previous)    mpris Previous ;;
+  media-play-pause)  mpris PlayPause ;;
+  media-next)        mpris Next ;;
+  set-display-brightness)
+    [[ ${3:-} =~ ^[0-9]+$ ]] && [ "$3" -le 100 ] || exit 2
+    set_display "$3" 1 ;;
+  set-keyboard-backlight)
+    [[ ${3:-} =~ ^[0-9]+$ ]] && [ "$3" -le 100 ] || exit 2
+    set_keyboard "$3" ;;
+  toggle-mic)        wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle ;;
+  cycle-output)      cycle_output ;;
+  toggle-effects)
+    command -v easyeffects >/dev/null || exit 1
+    if [ "$(gsettings get com.github.wwmm.easyeffects bypass 2>/dev/null)" = true ]; then easyeffects -b 2; else easyeffects -b 1; fi ;;
+  toggle-auto-brightness) exit 1 ;;   # pas de luminosité automatique dans Plasma
+  toggle-night-light)     toggle_night_color ;;
+  set-power-profile)
+    case ${3:-} in power-saver|balanced|performance) ;; *) exit 2 ;; esac
+    busctl set-property org.freedesktop.UPower.PowerProfiles /org/freedesktop/UPower/PowerProfiles \
+      org.freedesktop.UPower.PowerProfiles ActiveProfile s "$3" ;;
+  toggle-full-charge)   # page Énergie : 100 % pour cette fois, ou retour à 80 % (remis à 80 % au branchement
+    # du chargeur par /etc/udev/rules.d/90-batterie-seuil-80.rules, qui rend l'attribut inscriptible par t1bridge)
+    f=$(ls /sys/class/power_supply/*/charge_control_end_threshold 2>/dev/null | head -n1)
+    [ -w "$f" ] || exit 1
+    read -r cur <"$f"
+    if [ "$cur" = 0 ] || [ "$cur" -ge 100 ]; then echo 80 >"$f"; else echo 100 >"$f"; fi ;;
+  toggle-camera) exit 1 ;;   # pas de caméra virtuelle sur le T2
+  launch-app)   # N = rang dans le panneau ; l'id vient du cache écrit par t1-touchbar-apps
+    [[ ${3:-} =~ ^[0-9]+$ ]] || exit 2
+    read -r app <"${XDG_CACHE_HOME:-$HOME/.cache}/t1bridge/apps/$3.id" 2>/dev/null || exit 1
+    systemd-run --user --collect --quiet -p ExitType=cgroup -- gtk-launch "$app" </dev/null >/dev/null 2>&1 ;;
+  *) exit 2 ;;
+esac

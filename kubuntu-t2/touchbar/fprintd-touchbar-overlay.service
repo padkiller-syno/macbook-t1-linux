@@ -1,0 +1,12 @@
+[Unit]
+Description=Invite Touch ID (fprintd) sur la Touch Bar t1bridge
+After=dbus.service t1-touchbar-hw.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/t1bridge/fprintd-touchbar-overlay
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

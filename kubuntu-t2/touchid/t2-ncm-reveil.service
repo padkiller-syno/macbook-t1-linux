@@ -1,0 +1,12 @@
+[Unit]
+Description=Réveil de la liaison t2_ncm (puce T2) pour Touch ID
+Before=kait2en-t2-touchid.service
+After=systemd-udev-settle.service systemd-udevd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/t2-ncm-reveil
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

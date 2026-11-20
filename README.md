@@ -12,6 +12,7 @@ configurer (projet [t1bridge](https://github.com/standardagents/t1bridge)).
 |---|---|---|
 | **Debian 13 (trixie)**, noyau 7.2 (backports), GNOME 48 / Wayland | ✅ **version suivie**, la plus complète | [`debian13/`](debian13/README.md) |
 | Fedora 44 | archive (Touch Bar, caméra, clavier, écran) | [`fedora44/`](fedora44/README.md) |
+| **Kubuntu 26.04 (t2linux)** sur **MacBook Pro T2** (15,1, 2018) | 🚧 branche `t2` : Touch Bar t1bridge, Touch ID, énergie, démarrage | [`kubuntu-t2/`](kubuntu-t2/README.md) |
 
 ## Machine
 
@@ -59,6 +60,7 @@ avec des pages volume, éclairage, système et énergie (profils d'énergie), de
 ## Organisation du dépôt
 
 ```
+kubuntu-t2/ ← MacBook Pro T2 sous Kubuntu (branche t2)
 debian13/   ← installation Debian 13 : un dossier par chantier (wifi, son, touchbar, touchid…)
 fedora44/   ← première installation sous Fedora 44 (archive)
 ```

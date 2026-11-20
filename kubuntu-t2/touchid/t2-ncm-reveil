@@ -1,0 +1,32 @@
+#!/bin/sh
+# MacBook Pro T2 : la liaison USB CDC-NCM vers la puce T2 (t2_ncm, utilisée par Touch ID) reste souvent sans porteuse
+# au démarrage (NO-CARRIER, que cdc_ncm soit chargé dans l'initramfs ou après). Débrancher/rebrancher le périphérique
+# côté USB (authorized 0 puis 1) relance la négociation. Lancé par t2-ncm-reveil.service avant kait2en-t2-touchid,
+# et utilisable à la main ou après la veille. Source : dépôt macbook-t1-linux, kubuntu-t2/touchid/.
+IF=t2_ncm
+log() { logger -t t2-ncm-reveil "$*"; echo "$*"; }
+porteuse() { [ "$(cat /sys/class/net/$IF/carrier 2>/dev/null)" = 1 ]; }
+attendre() { i=0; while [ $i -lt $1 ]; do "$2" && return 0; sleep 1; i=$((i + 1)); done; return 1; }
+existe() { [ -e /sys/class/net/$IF ]; }
+
+attendre 15 existe || { log "$IF absente après 15 s, rien à faire"; exit 0; }
+ip link set $IF up 2>/dev/null
+attendre 3 porteuse && { log "$IF a déjà sa porteuse"; exit 0; }
+
+USB=$(readlink -f /sys/class/net/$IF/device/..)   # périphérique USB (ex. …/usb7/7-1), pas l'interface 7-1:1.0
+[ -w "$USB/authorized" ] || { log "authorized introuvable pour $USB"; exit 1; }
+n=1
+while [ $n -le 3 ]; do
+  log "essai $n : $IF sans porteuse, réautorisation de ${USB##*/}"
+  echo 0 > "$USB/authorized"; sleep 1; echo 1 > "$USB/authorized"
+  attendre 10 existe && ip link set $IF up 2>/dev/null
+  if attendre 10 porteuse; then
+    log "porteuse revenue (essai $n)"
+    # --no-block : au boot, kait2en-t2-touchid est ordonné après ce service, un restart bloquant attendrait sa fin
+    systemctl is-active -q kait2en-t2-touchid && systemctl --no-block restart kait2en-t2-touchid
+    exit 0
+  fi
+  n=$((n + 1))
+done
+log "échec : $IF toujours sans porteuse après 3 essais"
+exit 1
